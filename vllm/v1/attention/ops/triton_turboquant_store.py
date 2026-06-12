@@ -16,6 +16,11 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
+from vllm.v1.attention.ops.turboquant_profiler import (
+    STORE_KERNEL,
+    STORE_PREPROCESS,
+    tq_profile_stage,
+)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Shared: value uniform quantization + pack + scale/zero store
@@ -188,7 +193,7 @@ def _tq_fused_store_fp8(
     # ── FP8 KEY: cast to FP8 in-kernel and store ─────────────────
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
-    k_vals = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0)
+    k_vals = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
     k_fp8 = k_vals.to(tl.float8e4b15) if FP8_E4B15 else k_vals.to(tl.float8e4nv)
     k_bytes = k_fp8.to(tl.uint8, bitcast=True)
     tl.store(KV_cache_ptr + slot_base + d_offs, k_bytes, mask=d_mask)
@@ -386,9 +391,47 @@ def triton_turboquant_store(
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
         grid = (NH,)
-        _tq_fused_store_fp8[grid](
-            k_flat,
+        with tq_profile_stage(STORE_KERNEL):
+            _tq_fused_store_fp8[grid](
+                k_flat,
+                v_flat,
+                kv_cache.view(-1),
+                slot_mapping,
+                stride_cache_block=stride_block,
+                stride_cache_pos=stride_pos,
+                stride_cache_head=stride_head,
+                D=D,
+                H=H,
+                BLOCK_SIZE=block_size,
+                BLOCK_D=BLOCK_D,
+                KPS=key_packed_size,
+                VQB=value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                BLOCK_VAL=BLOCK_VAL,
+                BLOCK_GRP=block_grp,
+                FP8_E4B15=fp8_e4b15,
+                num_warps=4,
+                num_stages=1,
+            )
+        return
+
+    # ── MSE PATH: external GEMM + fused bucketize/pack kernel ──
+    # Normalize + rotation GEMM externally (cuBLAS is faster than in-kernel)
+    with tq_profile_stage(STORE_PREPROCESS):
+        k_flat = key.float().reshape(NH, D)
+        norms = k_flat.norm(dim=1, keepdim=True)
+        x_hat = k_flat / (norms + 1e-8)
+        y = x_hat @ PiT
+        v_flat = value.float().reshape(NH, D)
+
+    # Fused kernel: bucketize + MSE index pack + norm store + value pack
+    grid = (NH,)
+    with tq_profile_stage(STORE_KERNEL):
+        _tq_fused_store_mse[grid](
+            y,
+            norms.squeeze(1),
             v_flat,
+            midpoints,
             kv_cache.view(-1),
             slot_mapping,
             stride_cache_block=stride_block,
@@ -398,50 +441,14 @@ def triton_turboquant_store(
             H=H,
             BLOCK_SIZE=block_size,
             BLOCK_D=BLOCK_D,
+            MSE_BYTES=mse_bytes,
             KPS=key_packed_size,
             VQB=value_quant_bits,
             VAL_DATA_BYTES=val_data_bytes,
             BLOCK_VAL=BLOCK_VAL,
+            MSE_BITS=mse_bits,
+            N_CENTROIDS=n_centroids,
             BLOCK_GRP=block_grp,
-            FP8_E4B15=fp8_e4b15,
             num_warps=4,
             num_stages=1,
         )
-        return
-
-    # ── MSE PATH: external GEMM + fused bucketize/pack kernel ──
-    # Normalize + rotation GEMM externally (cuBLAS is faster than in-kernel)
-    k_flat = key.float().reshape(NH, D)
-    norms = k_flat.norm(dim=1, keepdim=True)
-    x_hat = k_flat / (norms + 1e-8)
-    y = x_hat @ PiT
-
-    v_flat = value.float().reshape(NH, D)
-
-    # Fused kernel: bucketize + MSE index pack + norm store + value pack
-    grid = (NH,)
-    _tq_fused_store_mse[grid](
-        y,
-        norms.squeeze(1),
-        v_flat,
-        midpoints,
-        kv_cache.view(-1),
-        slot_mapping,
-        stride_cache_block=stride_block,
-        stride_cache_pos=stride_pos,
-        stride_cache_head=stride_head,
-        D=D,
-        H=H,
-        BLOCK_SIZE=block_size,
-        BLOCK_D=BLOCK_D,
-        MSE_BYTES=mse_bytes,
-        KPS=key_packed_size,
-        VQB=value_quant_bits,
-        VAL_DATA_BYTES=val_data_bytes,
-        BLOCK_VAL=BLOCK_VAL,
-        MSE_BITS=mse_bits,
-        N_CENTROIDS=n_centroids,
-        BLOCK_GRP=block_grp,
-        num_warps=4,
-        num_stages=1,
-    )

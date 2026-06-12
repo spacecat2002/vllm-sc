@@ -161,6 +161,12 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+        from vllm.v1.attention.ops.turboquant_profiler import (
+            register_global_kv_cache_dtype,
+        )
+
+        register_global_kv_cache_dtype(vllm_config.cache_config.cache_dtype)
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -865,6 +871,12 @@ class Worker(WorkerBase):
                 and output is None
             ):
                 output = self.model_runner.pool()  # type: ignore
+            if forward_pass:
+                from vllm.v1.attention.ops.turboquant_profiler import (
+                    notify_kv_cache_stage_engine_step,
+                )
+
+                notify_kv_cache_stage_engine_step()
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):

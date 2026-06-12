@@ -18,6 +18,12 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
+from vllm.v1.attention.ops.turboquant_profiler import (
+    DECODE_Q_ROTATE,
+    DECODE_STAGE1,
+    DECODE_STAGE2,
+    tq_profile_stage,
+)
 
 _FP8_E4B15: dict[int, int] = {}
 
@@ -522,10 +528,11 @@ def triton_turboquant_decode_attention(
     if key_fp8:
         q_rot = query.contiguous()
     else:
-        q_float = query.float()
-        if PiT is None:
-            PiT = Pi.T.contiguous()
-        q_rot = (q_float @ PiT).contiguous()
+        with tq_profile_stage(DECODE_Q_ROTATE):
+            q_float = query.float()
+            if PiT is None:
+                PiT = Pi.T.contiguous()
+            q_rot = (q_float @ PiT).contiguous()
 
     NUM_KV_SPLITS = max_num_kv_splits
 
@@ -551,41 +558,42 @@ def triton_turboquant_decode_attention(
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
     BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
-    _tq_decode_stage1[grid](
-        q_rot,
-        kv_cache,
-        block_table,
-        seq_lens,
-        centroids,
-        mid_o,
-        q_rot.stride(0),
-        q_rot.stride(1),
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
-        block_table.stride(0),
-        mid_o.stride(0),
-        mid_o.stride(1),
-        mid_o.stride(2),
-        NUM_KV_HEADS=Hk,
-        HEAD_DIM=D,
-        BLOCK_SIZE=block_size,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        KV_GROUP_SIZE=kv_group_size,
-        MSE_BITS=mse_bits,
-        MSE_BYTES=cfg["mse_bytes"],
-        KPS=key_packed_size,
-        VQB=value_quant_bits,
-        VAL_DATA_BYTES=cfg["val_data_bytes"],
-        ATTN_SCALE=scale,
-        BLOCK_D=cfg["BLOCK_D"],
-        BLOCK_KV=BLOCK_KV,
-        KEY_FP8=1 if key_fp8 else 0,
-        NORM_CORRECTION=1 if norm_correction else 0,
-        FP8_E4B15=fp8_e4b15,
-        num_warps=1,
-        num_stages=1,
-    )
+    with tq_profile_stage(DECODE_STAGE1):
+        _tq_decode_stage1[grid](
+            q_rot,
+            kv_cache,
+            block_table,
+            seq_lens,
+            centroids,
+            mid_o,
+            q_rot.stride(0),
+            q_rot.stride(1),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            NUM_KV_HEADS=Hk,
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            KV_GROUP_SIZE=kv_group_size,
+            MSE_BITS=mse_bits,
+            MSE_BYTES=cfg["mse_bytes"],
+            KPS=key_packed_size,
+            VQB=value_quant_bits,
+            VAL_DATA_BYTES=cfg["val_data_bytes"],
+            ATTN_SCALE=scale,
+            BLOCK_D=cfg["BLOCK_D"],
+            BLOCK_KV=BLOCK_KV,
+            KEY_FP8=1 if key_fp8 else 0,
+            NORM_CORRECTION=1 if norm_correction else 0,
+            FP8_E4B15=fp8_e4b15,
+            num_warps=1,
+            num_stages=1,
+        )
 
     # Stage 2: Reduce across KV splits
     # Output in query dtype — eliminates float16_copy kernel after stage2
@@ -608,23 +616,24 @@ def triton_turboquant_decode_attention(
             buf_holder._tq_lse_buf = lse
 
     grid2 = (B, Hq)
-    _fwd_kernel_stage2[grid2](
-        mid_o,
-        output,
-        lse,
-        seq_lens,
-        mid_o.stride(0),
-        mid_o.stride(1),
-        mid_o.stride(2),
-        output.stride(0),
-        output.stride(1),
-        lse.stride(0),
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        BLOCK_DV=cfg["BLOCK_D"],
-        Lv=D,
-        OUTPUT_FP16=1 if out_dtype == torch.float16 else 0,
-        num_warps=4,
-        num_stages=2,
-    )
+    with tq_profile_stage(DECODE_STAGE2):
+        _fwd_kernel_stage2[grid2](
+            mid_o,
+            output,
+            lse,
+            seq_lens,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            BLOCK_DV=cfg["BLOCK_D"],
+            Lv=D,
+            OUTPUT_FP16=1 if out_dtype == torch.float16 else 0,
+            num_warps=4,
+            num_stages=2,
+        )
 
     return output  # already in query dtype
