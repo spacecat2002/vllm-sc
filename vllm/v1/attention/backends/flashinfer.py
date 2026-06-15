@@ -1483,7 +1483,7 @@ class FlashInferImpl(AttentionImpl):
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
             assert attn_metadata.cascade_wrapper is not None
-            with kv_cache_profile_stage(FLASH_ATTN):
+            with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
                 output.copy_(attn_metadata.cascade_wrapper.run(query, kv_cache))
             return output
 
@@ -1546,7 +1546,7 @@ class FlashInferImpl(AttentionImpl):
                     assert prefill_wrapper._new_tokens._sm_scale == self.scale
                     assert prefill_wrapper._new_tokens._causal
 
-                    with kv_cache_profile_stage(FLASH_ATTN):
+                    with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
                         prefill_wrapper.run(
                             layer,
                             prefill_query,
@@ -1583,7 +1583,7 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         out_prefill = output[num_decode_tokens:]
 
-                    with kv_cache_profile_stage(FLASH_ATTN):
+                    with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
                         prefill_wrapper.run(
                             prefill_query,
                             kv_cache_permute,
@@ -1676,7 +1676,7 @@ class FlashInferImpl(AttentionImpl):
                     mock_kv_cache = kv_cache_permute
                     mock_block_table = block_tables_prefill
 
-                with kv_cache_profile_stage(FLASH_ATTN):
+                with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
                     trtllm_batch_context_with_kv_cache(
                         query=prefill_query,
                         kv_cache=mock_kv_cache,
@@ -1736,7 +1736,7 @@ class FlashInferImpl(AttentionImpl):
                         dtype=torch.float32,
                         device=decode_query.device,
                     )
-                    with kv_cache_profile_stage(DECODE_STAGE1):
+                    with kv_cache_profile_stage(DECODE_STAGE1, layer=layer):
                         decode_wrapper.run(
                             decode_query,
                             kv_cache_permute,
@@ -1753,7 +1753,7 @@ class FlashInferImpl(AttentionImpl):
                         get_dcp_group(),
                     )
                 else:
-                    with kv_cache_profile_stage(DECODE_STAGE1):
+                    with kv_cache_profile_stage(DECODE_STAGE1, layer=layer):
                         decode_wrapper.run(
                             decode_query,
                             kv_cache_permute,
@@ -1817,7 +1817,7 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
 
-                with kv_cache_profile_stage(DECODE_STAGE1):
+                with kv_cache_profile_stage(DECODE_STAGE1, layer=layer):
                     trtllm_batch_decode_with_kv_cache(
                         query=decode_query,
                         kv_cache=(
@@ -1861,7 +1861,7 @@ class FlashInferImpl(AttentionImpl):
             # actual tokens.
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
-            with kv_cache_profile_stage(STORE_KERNEL):
+            with kv_cache_profile_stage(STORE_KERNEL, layer=layer):
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
                     key,
                     value,

@@ -509,6 +509,7 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    layer: Any = None,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -528,7 +529,7 @@ def triton_turboquant_decode_attention(
     if key_fp8:
         q_rot = query.contiguous()
     else:
-        with kv_cache_profile_stage(DECODE_Q_ROTATE):
+        with kv_cache_profile_stage(DECODE_Q_ROTATE, layer=layer):
             q_float = query.float()
             if PiT is None:
                 PiT = Pi.T.contiguous()
@@ -558,7 +559,7 @@ def triton_turboquant_decode_attention(
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
     BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
-    with kv_cache_profile_stage(DECODE_STAGE1):
+    with kv_cache_profile_stage(DECODE_STAGE1, layer=layer):
         _tq_decode_stage1[grid](
             q_rot,
             kv_cache,
@@ -616,7 +617,7 @@ def triton_turboquant_decode_attention(
             buf_holder._tq_lse_buf = lse
 
     grid2 = (B, Hq)
-    with kv_cache_profile_stage(DECODE_STAGE2):
+    with kv_cache_profile_stage(DECODE_STAGE2, layer=layer):
         _fwd_kernel_stage2[grid2](
             mid_o,
             output,

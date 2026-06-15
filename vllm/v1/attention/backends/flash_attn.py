@@ -32,6 +32,7 @@ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.kv_cache_stage_profiler import (
+    FLASH_ATTN,
     STORE_KERNEL,
     attention_stage_for_query_len,
     flash_attention_profile_stage,
@@ -787,6 +788,7 @@ class FlashAttentionImpl(AttentionImpl):
                     value_cache,
                     output[:num_actual_tokens],
                     attn_metadata,
+                    layer=layer,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -799,7 +801,7 @@ class FlashAttentionImpl(AttentionImpl):
                     else None
                 )
                 attn_stage = attention_stage_for_query_len(max_seqlen_q)
-                with flash_attention_profile_stage(attn_stage):
+                with flash_attention_profile_stage(attn_stage, layer=layer):
                     flash_attn_varlen_func(
                         q=query[:num_actual_tokens],
                         k=key_cache,
@@ -827,7 +829,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         # Cascade attention (rare case).
         cascade_stage = attention_stage_for_query_len(attn_metadata.max_query_len)
-        with flash_attention_profile_stage(cascade_stage):
+        with flash_attention_profile_stage(cascade_stage, layer=layer):
             cascade_attention(
                 output[:num_actual_tokens],
                 query[:num_actual_tokens],
@@ -880,7 +882,7 @@ class FlashAttentionImpl(AttentionImpl):
         # and value[:num_actual_tokens] because the reshape_and_cache_flash
         # op uses the slot_mapping's shape to determine the number of
         # actual tokens.
-        with flash_attention_profile_stage(STORE_KERNEL):
+        with flash_attention_profile_stage(STORE_KERNEL, layer=layer):
             reshape_and_cache_flash(
                 key,
                 value,
@@ -901,6 +903,7 @@ class FlashAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
+        layer: torch.nn.Module,
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
@@ -912,6 +915,7 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens_q = attn_metadata.query_start_loc
         max_seqlen_q = attn_metadata.max_query_len
         block_table = attn_metadata.block_table
+        attn_stage = attention_stage_for_query_len(max_seqlen_q)
 
         query = query.contiguous()
         query_across_dcp = get_dcp_group().all_gather(query, dim=1)
@@ -925,29 +929,30 @@ class FlashAttentionImpl(AttentionImpl):
                 self._dcp_dtype,
             ),
         )
-        context_attn_out, context_lse = flash_attn_varlen_func(
-            q=query_across_dcp,
-            k=key_cache,
-            v=value_cache,
-            out=dcp_context_out,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=attn_metadata.dcp_context_kv_lens,
-            max_seqlen_k=attn_metadata.max_dcp_context_kv_len,
-            softmax_scale=self.scale,
-            causal=False,
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            block_table=block_table,
-            softcap=self.logits_soft_cap,
-            return_softmax_lse=True,
-            scheduler_metadata=attn_metadata.scheduler_metadata,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            num_splits=attn_metadata.max_num_splits,
-        )
+        with flash_attention_profile_stage(attn_stage, layer=layer):
+            context_attn_out, context_lse = flash_attn_varlen_func(
+                q=query_across_dcp,
+                k=key_cache,
+                v=value_cache,
+                out=dcp_context_out,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=attn_metadata.dcp_context_kv_lens,
+                max_seqlen_k=attn_metadata.max_dcp_context_kv_len,
+                softmax_scale=self.scale,
+                causal=False,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                num_splits=attn_metadata.max_num_splits,
+            )
         # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
         context_attn_out_cor, context_lse_cor = self.dcp_combine(
             context_attn_out,
@@ -960,27 +965,28 @@ class FlashAttentionImpl(AttentionImpl):
         (dcp_query_out,) = current_workspace_manager().get_simultaneous(
             ((query.shape[0], self.num_heads, self.head_size), self._dcp_dtype),
         )
-        query_attn_out, query_lse = flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            out=dcp_query_out,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            cu_seqlens_k=cu_seqlens_q,
-            max_seqlen_k=max_seqlen_q,
-            softmax_scale=self.scale,
-            causal=attn_metadata.causal,
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            softcap=self.logits_soft_cap,
-            return_softmax_lse=True,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            num_splits=attn_metadata.max_num_splits,
-        )
+        with flash_attention_profile_stage(attn_stage, layer=layer):
+            query_attn_out, query_lse = flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                out=dcp_query_out,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_k=max_seqlen_q,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                num_splits=attn_metadata.max_num_splits,
+            )
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape
         merge_attn_states(
@@ -1035,28 +1041,29 @@ class FlashAttentionImpl(AttentionImpl):
         sliding_window_size = (
             list(self.sliding_window) if self.sliding_window is not None else None
         )
-        flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            out=output,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=False,  # Encoder attention is bidirectional
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            softcap=self.logits_soft_cap,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=layer._q_scale.expand(descale_shape)
-            if self.supports_quant_query_input
-            else None,
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
-            num_splits=1 if self.batch_invariant_enabled else 0,
-        )
+        with flash_attention_profile_stage(FLASH_ATTN, layer=layer):
+            flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                out=output,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=False,  # Encoder attention is bidirectional
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape)
+                if self.supports_quant_query_input
+                else None,
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                num_splits=1 if self.batch_invariant_enabled else 0,
+            )
 
         return output
 

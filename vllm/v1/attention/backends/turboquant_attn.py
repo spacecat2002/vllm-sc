@@ -560,6 +560,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
+            layer=layer,
         )
 
     # ------------------------------------------------------------------ #
@@ -583,15 +584,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
         if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
-            return self._flash_attn_varlen(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.max_query_len,
-            )
+            with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
+                return self._flash_attn_varlen(
+                    q=query,
+                    k=key,
+                    v=value,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.max_query_len,
+                )
 
         # Continuation or no flash_attn: per-request attention.
         # For continuation chunks (seq_len > q_len), we must attend to
@@ -647,27 +649,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     # Assign to slice to avoid gpu/cpu sync.
                     self._cu_2[1:2] = q_len
                     cu = self._cu_2
-                    out = self._flash_attn_varlen(
-                        q=q_seq,
-                        k=k_seq,
-                        v=v_seq,
-                        cu_seqlens_q=cu,
-                        cu_seqlens_k=cu,
-                        max_seqlen_q=q_len,
-                        max_seqlen_k=q_len,
-                    )
+                    with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
+                        out = self._flash_attn_varlen(
+                            q=q_seq,
+                            k=k_seq,
+                            v=v_seq,
+                            cu_seqlens_q=cu,
+                            cu_seqlens_k=cu,
+                            max_seqlen_q=q_len,
+                            max_seqlen_k=q_len,
+                        )
                 else:
                     q_t = q_seq.transpose(0, 1).contiguous()
                     k_t = k_seq.transpose(0, 1).contiguous()
                     v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
+                    with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
+                        out = F.scaled_dot_product_attention(
+                            q_t,
+                            k_t,
+                            v_t,
+                            is_causal=True,
+                            scale=self.scale,
+                            enable_gqa=use_gqa,
+                        ).transpose(0, 1)
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache
@@ -691,10 +695,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         scale=self.scale,
                         mse_bits=self.tq_config.key_mse_bits,
                         key_packed_size=self.tq_config.key_packed_size,
-                        value_quant_bits=(self.tq_config.effective_value_quant_bits),
+                        value_quant_bits=(
+                            self.tq_config.effective_value_quant_bits
+                        ),
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        layer=layer,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -760,7 +767,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_cached = v_buf[:, :, :alloc_len, :]
 
         grid = (alloc_len, 1 * Hk)
-        with kv_cache_profile_stage(DEQUANT_BULK):
+        with kv_cache_profile_stage(DEQUANT_BULK, layer=layer):
             _tq_full_dequant_kv[grid](
                 kv_cache,
                 block_table,
@@ -794,7 +801,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Inverse-rotate MSE keys back to original space
         if not self.tq_config.key_fp8:
-            with kv_cache_profile_stage(INVERSE_ROTATE):
+            with kv_cache_profile_stage(INVERSE_ROTATE, layer=layer):
                 # fp16 matmul for rotation (2× less bandwidth, uses fp16 TC)
                 Pi_half = layer._tq_Pi_half
                 k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
@@ -831,7 +838,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             self._cu_2_k[1:2] = seq_len
             cu_seqlens_q = self._cu_2_q
             cu_seqlens_k = self._cu_2_k
-            with kv_cache_profile_stage(FLASH_ATTN):
+            with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
                 return self._flash_attn_varlen(
                     q=query,
                     k=k_full,
@@ -851,14 +858,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
             k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
             mask = k_pos <= q_pos  # (q_len, seq_len)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
+            with kv_cache_profile_stage(FLASH_ATTN, layer=layer):
+                out = F.scaled_dot_product_attention(
+                    q_t,
+                    k_t,
+                    v_t,
+                    attn_mask=mask,
+                    scale=self.scale,
+                    enable_gqa=(Hk < Hq),
+                )  # (1, Hq, q_len, D)
             return out[0].transpose(0, 1)  # (q_len, Hq, D)
 
     # ------------------------------------------------------------------ #
@@ -911,5 +919,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
+            layer=layer,
         )
         return result

@@ -11,6 +11,7 @@ The launcher `triton_turboquant_store` selects the appropriate kernel.
 """
 
 import math
+from typing import Any
 
 import torch
 
@@ -363,6 +364,7 @@ def triton_turboquant_store(
     key_packed_size: int,
     value_quant_bits: int,
     key_fp8: bool = False,
+    layer: Any = None,
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
     N, H, D = key.shape
@@ -391,7 +393,7 @@ def triton_turboquant_store(
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
         grid = (NH,)
-        with kv_cache_profile_stage(STORE_KERNEL):
+        with kv_cache_profile_stage(STORE_KERNEL, layer=layer):
             _tq_fused_store_fp8[grid](
                 k_flat,
                 v_flat,
@@ -417,7 +419,7 @@ def triton_turboquant_store(
 
     # ── MSE PATH: external GEMM + fused bucketize/pack kernel ──
     # Normalize + rotation GEMM externally (cuBLAS is faster than in-kernel)
-    with kv_cache_profile_stage(STORE_PREPROCESS):
+    with kv_cache_profile_stage(STORE_PREPROCESS, layer=layer):
         k_flat = key.float().reshape(NH, D)
         norms = k_flat.norm(dim=1, keepdim=True)
         x_hat = k_flat / (norms + 1e-8)
@@ -426,7 +428,7 @@ def triton_turboquant_store(
 
     # Fused kernel: bucketize + MSE index pack + norm store + value pack
     grid = (NH,)
-    with kv_cache_profile_stage(STORE_KERNEL):
+    with kv_cache_profile_stage(STORE_KERNEL, layer=layer):
         _tq_fused_store_mse[grid](
             y,
             norms.squeeze(1),

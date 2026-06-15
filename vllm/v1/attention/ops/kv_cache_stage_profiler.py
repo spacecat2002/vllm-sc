@@ -5,9 +5,9 @@
 Works for both TurboQuant and standard (e.g. FlashAttention) backends so
 quantized vs baseline runs produce the same stage table.
 
-Enable with ``VLLM_KV_CACHE_STAGE_PROFILE=1``.  Results print every
-``VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL`` stage samples (default 100) and/or
-append to ``VLLM_KV_CACHE_STAGE_PROFILE_FILE``.
+Enable with ``VLLM_KV_CACHE_STAGE_PROFILE=N`` (``N > 0``).  The value is the
+flush interval in engine steps (``1`` = every step).  Results append to
+``VLLM_KV_CACHE_STAGE_PROFILE_FILE`` when set.
 
 Stage mapping (baseline FlashAttention vs TurboQuant):
 
@@ -70,13 +70,19 @@ _ALL_STAGES = (
 _enabled: bool | None = None
 _profiler: KVCacheStageProfiler | None = None
 _registered_global_kv_cache_dtype: str | None = None
+_registered_skip_layers: frozenset[str] = frozenset()
 _lock = threading.Lock()
+
+
+def kv_cache_stage_profile_interval() -> int:
+    """Return flush interval; 0 means profiling is disabled."""
+    return envs.VLLM_KV_CACHE_STAGE_PROFILE
 
 
 def is_kv_cache_stage_profiling_enabled() -> bool:
     global _enabled
     if _enabled is None:
-        _enabled = envs.VLLM_KV_CACHE_STAGE_PROFILE
+        _enabled = kv_cache_stage_profile_interval() > 0
     return _enabled
 
 
@@ -89,6 +95,12 @@ def register_global_kv_cache_dtype(kv_cache_dtype: str) -> None:
     """Cache the global KV cache dtype (V2 runner may lack config context)."""
     global _registered_global_kv_cache_dtype
     _registered_global_kv_cache_dtype = kv_cache_dtype
+
+
+def register_kv_cache_skip_layers(skip_layers: list[str]) -> None:
+    """Cache boundary layer indices excluded from profiling during TQ serving."""
+    global _registered_skip_layers
+    _registered_skip_layers = frozenset(skip_layers)
 
 
 def _global_kv_cache_dtype() -> str:
@@ -104,11 +116,37 @@ def is_turboquant_serving() -> bool:
     return _global_kv_cache_dtype().startswith("turboquant")
 
 
-def should_profile_flash_attention_kv_stage() -> bool:
-    """Skip FA profiling during TQ serving (FA only runs on boundary layers)."""
+def _resolve_layer_name(layer: object | None) -> str | None:
+    if layer is None:
+        return None
+    if isinstance(layer, str):
+        return layer
+    return getattr(layer, "layer_name", None)
+
+
+def should_profile_layer(layer: object | None = None) -> bool:
+    """Return whether the current layer should contribute profiler samples.
+
+    Baseline (non-TurboQuant) serving profiles every attention layer.
+    TurboQuant serving profiles only compressed layers; boundary layers listed
+    in ``kv_cache_dtype_skip_layers`` are excluded.
+    """
     if not is_kv_cache_stage_profiling_enabled():
         return False
-    return not is_turboquant_serving()
+    if not is_turboquant_serving():
+        return True
+
+    layer_name = _resolve_layer_name(layer)
+    if layer_name is None:
+        return True
+
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    try:
+        layer_idx = str(extract_layer_index(layer_name))
+    except ValueError:
+        return True
+    return layer_idx not in _registered_skip_layers
 
 
 @dataclass
@@ -145,7 +183,7 @@ class KVCacheStageProfiler:
     def __init__(self) -> None:
         self._samples: dict[str, list[float]] = defaultdict(list)
         self._engine_steps = 0
-        self._interval = envs.VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL
+        self._interval = kv_cache_stage_profile_interval()
 
     def record(self, name: str, start: torch.cuda.Event, end: torch.cuda.Event) -> None:
         end.synchronize()
@@ -191,26 +229,49 @@ class KVCacheStageProfiler:
         )
 
     def _emit(self, stats: KVCacheStageStats, counts: dict[str, int]) -> None:
-        lines = [
-            "KV cache stage breakdown (mean ms per layer-call, over last "
-            f"{self._interval} engine step(s), max n={stats.sample_count}):",
-        ]
-        for stage in _ALL_STAGES:
-            val = stats.to_dict()[stage]
-            n = counts.get(stage, 0)
-            lines.append(f"  {stage}: {val:.6f} ms (n={n})")
-        store_total = stats.store_preprocess_ms + stats.store_kernel_ms
-        decode_total = (
-            stats.decode_q_rotate_ms + stats.decode_stage1_ms + stats.decode_stage2_ms
+        scope = (
+            "profiled TQ layer-call"
+            if is_turboquant_serving()
+            else "layer-call"
         )
-        lines.append(f"  store_total: {store_total:.6f} ms")
-        lines.append(f"  decode_total: {decode_total:.6f} ms")
+        lines = [
+            "KV cache stage breakdown (mean ms per "
+            f"{scope}, over last {self._interval} engine step(s), "
+            f"max n={stats.sample_count}):",
+        ]
+        active_stages = [stage for stage in _ALL_STAGES if counts.get(stage, 0) > 0]
+        stats_dict = stats.to_dict()
+        for stage in active_stages:
+            val = stats_dict[stage]
+            n = counts[stage]
+            lines.append(f"  {stage}: {val:.6f} ms (n={n})")
+
+        # store_stages = (STORE_PREPROCESS, STORE_KERNEL)
+        # if any(counts.get(stage, 0) > 0 for stage in store_stages):
+        #     store_total = stats.store_preprocess_ms + stats.store_kernel_ms
+        #     lines.append(f"  store_total: {store_total:.6f} ms")
+
+        # decode_stages = (DECODE_Q_ROTATE, DECODE_STAGE1, DECODE_STAGE2)
+        # if any(counts.get(stage, 0) > 0 for stage in decode_stages):
+        #     decode_total = (
+        #         stats.decode_q_rotate_ms
+        #         + stats.decode_stage1_ms
+        #         + stats.decode_stage2_ms
+        #     )
+        #     lines.append(f"  decode_total: {decode_total:.6f} ms")
+
         msg = "\n".join(lines)
         logger.info(msg)
 
         profile_file = envs.VLLM_KV_CACHE_STAGE_PROFILE_FILE
         if profile_file:
-            record = {"stages": stats.to_dict()}
+            record = {
+                "stages": {
+                    stage: stats_dict[stage]
+                    for stage in active_stages
+                },
+                "sample_count": stats.sample_count,
+            }
             try:
                 with open(profile_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record) + "\n")
@@ -228,19 +289,20 @@ def get_kv_cache_stage_profiler() -> KVCacheStageProfiler:
 
 
 @contextmanager
-def flash_attention_profile_stage(name: str) -> Iterator[None]:
-    """Profile FA stages; disabled during TQ serving (boundary layers only)."""
-    if not should_profile_flash_attention_kv_stage():
-        yield
-        return
-    with kv_cache_profile_stage(name):
+def flash_attention_profile_stage(
+    name: str, layer: object | None = None
+) -> Iterator[None]:
+    """Profile FA / baseline attention stages for eligible layers."""
+    with kv_cache_profile_stage(name, layer=layer):
         yield
 
 
 @contextmanager
-def kv_cache_profile_stage(name: str) -> Iterator[None]:
+def kv_cache_profile_stage(
+    name: str, layer: object | None = None
+) -> Iterator[None]:
     """Context manager: time one KV-cache stage on the current CUDA stream."""
-    if not is_kv_cache_stage_profiling_enabled():
+    if not should_profile_layer(layer):
         yield
         return
 
@@ -258,11 +320,13 @@ def kv_cache_profile_stage(name: str) -> Iterator[None]:
             get_kv_cache_stage_profiler().record(name, start, end)
 
 
-def kv_cache_profile_scope(name: str) -> AbstractContextManager:
-    """Return a profiling context (nullcontext when disabled)."""
-    if not is_kv_cache_stage_profiling_enabled():
+def kv_cache_profile_scope(
+    name: str, layer: object | None = None
+) -> AbstractContextManager:
+    """Return a profiling context (nullcontext when disabled or filtered)."""
+    if not should_profile_layer(layer):
         return nullcontext()
-    return kv_cache_profile_stage(name)
+    return kv_cache_profile_stage(name, layer=layer)
 
 
 def notify_kv_cache_stage_engine_step() -> None:

@@ -163,9 +163,13 @@ class Worker(WorkerBase):
 
         from vllm.v1.attention.ops.kv_cache_stage_profiler import (
             register_global_kv_cache_dtype,
+            register_kv_cache_skip_layers,
         )
 
         register_global_kv_cache_dtype(vllm_config.cache_config.cache_dtype)
+        register_kv_cache_skip_layers(
+            list(vllm_config.cache_config.kv_cache_dtype_skip_layers)
+        )
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator

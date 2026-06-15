@@ -262,8 +262,7 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
-    VLLM_KV_CACHE_STAGE_PROFILE: bool = False
-    VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL: int = 100
+    VLLM_KV_CACHE_STAGE_PROFILE: int = 0
     VLLM_KV_CACHE_STAGE_PROFILE_FILE: str | None = None
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1926,11 +1925,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
     ),
-    "VLLM_KV_CACHE_STAGE_PROFILE": lambda: bool(
-        int(os.getenv("VLLM_KV_CACHE_STAGE_PROFILE", "0"))
-    ),
-    "VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL": lambda: int(
-        os.getenv("VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL", "100")
+    # 0 = disabled; N > 0 = enabled, flush every N engine steps.
+    "VLLM_KV_CACHE_STAGE_PROFILE": lambda: int(
+        os.getenv("VLLM_KV_CACHE_STAGE_PROFILE", "0")
     ),
     "VLLM_KV_CACHE_STAGE_PROFILE_FILE": lambda: os.getenv(
         "VLLM_KV_CACHE_STAGE_PROFILE_FILE"
