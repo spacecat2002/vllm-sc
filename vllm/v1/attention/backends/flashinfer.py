@@ -68,6 +68,12 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.kv_cache_stage_profiler import (
+    DECODE_STAGE1,
+    FLASH_ATTN,
+    STORE_KERNEL,
+    kv_cache_profile_stage,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -1477,7 +1483,8 @@ class FlashInferImpl(AttentionImpl):
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
             assert attn_metadata.cascade_wrapper is not None
-            output.copy_(attn_metadata.cascade_wrapper.run(query, kv_cache))
+            with kv_cache_profile_stage(FLASH_ATTN):
+                output.copy_(attn_metadata.cascade_wrapper.run(query, kv_cache))
             return output
 
         # When using spec decoding, num_decodes can be < num_decode_tokens
@@ -1539,14 +1546,15 @@ class FlashInferImpl(AttentionImpl):
                     assert prefill_wrapper._new_tokens._sm_scale == self.scale
                     assert prefill_wrapper._new_tokens._causal
 
-                    prefill_wrapper.run(
-                        layer,
-                        prefill_query,
-                        kv_cache_permute,
-                        key[num_decode_tokens:],
-                        value[num_decode_tokens:],
-                        out=output[num_decode_tokens:],
-                    )
+                    with kv_cache_profile_stage(FLASH_ATTN):
+                        prefill_wrapper.run(
+                            layer,
+                            prefill_query,
+                            kv_cache_permute,
+                            key[num_decode_tokens:],
+                            value[num_decode_tokens:],
+                            out=output[num_decode_tokens:],
+                        )
                 else:
                     assert isinstance(
                         prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
@@ -1575,14 +1583,15 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         out_prefill = output[num_decode_tokens:]
 
-                    prefill_wrapper.run(
-                        prefill_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=out_prefill,
-                        kv_cache_sf=kv_cache_sf,
-                    )
+                    with kv_cache_profile_stage(FLASH_ATTN):
+                        prefill_wrapper.run(
+                            prefill_query,
+                            kv_cache_permute,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            out=out_prefill,
+                            kv_cache_sf=kv_cache_sf,
+                        )
 
                     if needs_fp8_out_prefill:
                         output[
@@ -1667,25 +1676,26 @@ class FlashInferImpl(AttentionImpl):
                     mock_kv_cache = kv_cache_permute
                     mock_block_table = block_tables_prefill
 
-                trtllm_batch_context_with_kv_cache(
-                    query=prefill_query,
-                    kv_cache=mock_kv_cache,
-                    workspace_buffer=workspace_buffer,
-                    block_tables=mock_block_table,
-                    seq_lens=seq_lens_prefill,
-                    max_q_len=attn_metadata.prefill.max_q_len,
-                    max_kv_len=attn_metadata.prefill.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
-                    batch_size=attn_metadata.num_prefills,
-                    cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
-                    cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
-                    out=out,
-                    kv_cache_sf=prefill_kv_block_scales,
-                )
+                with kv_cache_profile_stage(FLASH_ATTN):
+                    trtllm_batch_context_with_kv_cache(
+                        query=prefill_query,
+                        kv_cache=mock_kv_cache,
+                        workspace_buffer=workspace_buffer,
+                        block_tables=mock_block_table,
+                        seq_lens=seq_lens_prefill,
+                        max_q_len=attn_metadata.prefill.max_q_len,
+                        max_kv_len=attn_metadata.prefill.max_seq_len,
+                        bmm1_scale=self.bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        batch_size=attn_metadata.num_prefills,
+                        cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
+                        cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        o_sf_scale=self.o_sf_scale,
+                        out=out,
+                        kv_cache_sf=prefill_kv_block_scales,
+                    )
 
                 if needs_fp8_out:
                     output[
@@ -1726,30 +1736,32 @@ class FlashInferImpl(AttentionImpl):
                         dtype=torch.float32,
                         device=decode_query.device,
                     )
-                    decode_wrapper.run(
-                        decode_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=output_tmp,
-                        lse=lse,
-                        return_lse=True,
-                        kv_cache_sf=kv_cache_sf,
-                    )
+                    with kv_cache_profile_stage(DECODE_STAGE1):
+                        decode_wrapper.run(
+                            decode_query,
+                            kv_cache_permute,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            out=output_tmp,
+                            lse=lse,
+                            return_lse=True,
+                            kv_cache_sf=kv_cache_sf,
+                        )
                     output[:num_decode_tokens] = self.dcp_combine(
                         output_tmp,
                         lse,
                         get_dcp_group(),
                     )
                 else:
-                    decode_wrapper.run(
-                        decode_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=out_decode,
-                        kv_cache_sf=kv_cache_sf,
-                    )
+                    with kv_cache_profile_stage(DECODE_STAGE1):
+                        decode_wrapper.run(
+                            decode_query,
+                            kv_cache_permute,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            out=out_decode,
+                            kv_cache_sf=kv_cache_sf,
+                        )
 
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out_decode.to(output.dtype))
@@ -1805,26 +1817,27 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
 
-                trtllm_batch_decode_with_kv_cache(
-                    query=decode_query,
-                    kv_cache=(
-                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_permute
-                    ),
-                    workspace_buffer=workspace_buffer,
-                    block_tables=block_tables_decode,
-                    seq_lens=seq_lens_decode,
-                    max_seq_len=attn_metadata.decode.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
-                    out=out,
-                    q_len_per_req=q_len_per_req,
-                    kv_cache_sf=(
-                        nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
-                    ),
-                )
+                with kv_cache_profile_stage(DECODE_STAGE1):
+                    trtllm_batch_decode_with_kv_cache(
+                        query=decode_query,
+                        kv_cache=(
+                            nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_permute
+                        ),
+                        workspace_buffer=workspace_buffer,
+                        block_tables=block_tables_decode,
+                        seq_lens=seq_lens_decode,
+                        max_seq_len=attn_metadata.decode.max_seq_len,
+                        bmm1_scale=self.bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        o_sf_scale=self.o_sf_scale,
+                        out=out,
+                        q_len_per_req=q_len_per_req,
+                        kv_cache_sf=(
+                            nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                        ),
+                    )
 
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out.to(output.dtype))
@@ -1848,16 +1861,17 @@ class FlashInferImpl(AttentionImpl):
             # actual tokens.
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                k_cache,
-                v_cache,
-                slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            with kv_cache_profile_stage(STORE_KERNEL):
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
 
 def fast_plan_decode(

@@ -161,7 +161,7 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
-        from vllm.v1.attention.ops.turboquant_profiler import (
+        from vllm.v1.attention.ops.kv_cache_stage_profiler import (
             register_global_kv_cache_dtype,
         )
 
@@ -872,7 +872,7 @@ class Worker(WorkerBase):
             ):
                 output = self.model_runner.pool()  # type: ignore
             if forward_pass:
-                from vllm.v1.attention.ops.turboquant_profiler import (
+                from vllm.v1.attention.ops.kv_cache_stage_profiler import (
                     notify_kv_cache_stage_engine_step,
                 )
 

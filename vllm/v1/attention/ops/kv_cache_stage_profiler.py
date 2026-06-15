@@ -5,8 +5,7 @@
 Works for both TurboQuant and standard (e.g. FlashAttention) backends so
 quantized vs baseline runs produce the same stage table.
 
-Enable with ``VLLM_KV_CACHE_STAGE_PROFILE=1`` (``VLLM_TURBOQUANT_PROFILE=1``
-is a deprecated alias).  Results print every
+Enable with ``VLLM_KV_CACHE_STAGE_PROFILE=1``.  Results print every
 ``VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL`` stage samples (default 100) and/or
 append to ``VLLM_KV_CACHE_STAGE_PROFILE_FILE``.
 
@@ -81,10 +80,6 @@ def is_kv_cache_stage_profiling_enabled() -> bool:
     return _enabled
 
 
-# Backward-compatible alias.
-is_turboquant_profiling_enabled = is_kv_cache_stage_profiling_enabled
-
-
 def attention_stage_for_query_len(max_query_len: int) -> str:
     """Map a forward step to decode vs prefill attention stage."""
     return DECODE_STAGE1 if max_query_len == 1 else FLASH_ATTN
@@ -142,10 +137,6 @@ class KVCacheStageStats:
             FLASH_ATTN: self.flash_attn_ms,
             "sample_count": self.sample_count,
         }
-
-
-# Backward-compatible alias.
-TQStageStats = KVCacheStageStats
 
 
 class KVCacheStageProfiler:
@@ -229,18 +220,11 @@ class KVCacheStageProfiler:
                 )
 
 
-# Backward-compatible aliases.
-TurboQuantProfiler = KVCacheStageProfiler
-
-
 def get_kv_cache_stage_profiler() -> KVCacheStageProfiler:
     global _profiler
     if _profiler is None:
         _profiler = KVCacheStageProfiler()
     return _profiler
-
-
-get_turboquant_profiler = get_kv_cache_stage_profiler
 
 
 @contextmanager
@@ -274,18 +258,11 @@ def kv_cache_profile_stage(name: str) -> Iterator[None]:
             get_kv_cache_stage_profiler().record(name, start, end)
 
 
-# Backward-compatible aliases.
-tq_profile_stage = kv_cache_profile_stage
-
-
 def kv_cache_profile_scope(name: str) -> AbstractContextManager:
     """Return a profiling context (nullcontext when disabled)."""
     if not is_kv_cache_stage_profiling_enabled():
         return nullcontext()
     return kv_cache_profile_stage(name)
-
-
-tq_profile_scope = kv_cache_profile_scope
 
 
 def notify_kv_cache_stage_engine_step() -> None:

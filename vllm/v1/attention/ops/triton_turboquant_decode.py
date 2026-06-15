@@ -18,11 +18,11 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
-from vllm.v1.attention.ops.turboquant_profiler import (
+from vllm.v1.attention.ops.kv_cache_stage_profiler import (
     DECODE_Q_ROTATE,
     DECODE_STAGE1,
     DECODE_STAGE2,
-    tq_profile_stage,
+    kv_cache_profile_stage,
 )
 
 _FP8_E4B15: dict[int, int] = {}
@@ -528,7 +528,7 @@ def triton_turboquant_decode_attention(
     if key_fp8:
         q_rot = query.contiguous()
     else:
-        with tq_profile_stage(DECODE_Q_ROTATE):
+        with kv_cache_profile_stage(DECODE_Q_ROTATE):
             q_float = query.float()
             if PiT is None:
                 PiT = Pi.T.contiguous()
@@ -558,7 +558,7 @@ def triton_turboquant_decode_attention(
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
     BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
-    with tq_profile_stage(DECODE_STAGE1):
+    with kv_cache_profile_stage(DECODE_STAGE1):
         _tq_decode_stage1[grid](
             q_rot,
             kv_cache,
@@ -616,7 +616,7 @@ def triton_turboquant_decode_attention(
             buf_holder._tq_lse_buf = lse
 
     grid2 = (B, Hq)
-    with tq_profile_stage(DECODE_STAGE2):
+    with kv_cache_profile_stage(DECODE_STAGE2):
         _fwd_kernel_stage2[grid2](
             mid_o,
             output,

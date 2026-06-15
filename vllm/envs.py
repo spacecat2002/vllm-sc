@@ -265,9 +265,6 @@ if TYPE_CHECKING:
     VLLM_KV_CACHE_STAGE_PROFILE: bool = False
     VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL: int = 100
     VLLM_KV_CACHE_STAGE_PROFILE_FILE: str | None = None
-    VLLM_TURBOQUANT_PROFILE: bool = False
-    VLLM_TURBOQUANT_PROFILE_INTERVAL: int = 100
-    VLLM_TURBOQUANT_PROFILE_FILE: str | None = None
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1930,41 +1927,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
     ),
     "VLLM_KV_CACHE_STAGE_PROFILE": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_KV_CACHE_STAGE_PROFILE",
-                os.getenv("VLLM_TURBOQUANT_PROFILE", "0"),
-            )
-        )
+        int(os.getenv("VLLM_KV_CACHE_STAGE_PROFILE", "0"))
     ),
     "VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL": lambda: int(
-        os.getenv(
-            "VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL",
-            os.getenv("VLLM_TURBOQUANT_PROFILE_INTERVAL", "100"),
-        )
+        os.getenv("VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL", "100")
     ),
     "VLLM_KV_CACHE_STAGE_PROFILE_FILE": lambda: os.getenv(
-        "VLLM_KV_CACHE_STAGE_PROFILE_FILE",
-        os.getenv("VLLM_TURBOQUANT_PROFILE_FILE"),
-    ),
-    # Deprecated aliases — use VLLM_KV_CACHE_STAGE_PROFILE instead.
-    "VLLM_TURBOQUANT_PROFILE": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_TURBOQUANT_PROFILE",
-                os.getenv("VLLM_KV_CACHE_STAGE_PROFILE", "0"),
-            )
-        )
-    ),
-    "VLLM_TURBOQUANT_PROFILE_INTERVAL": lambda: int(
-        os.getenv(
-            "VLLM_TURBOQUANT_PROFILE_INTERVAL",
-            os.getenv("VLLM_KV_CACHE_STAGE_PROFILE_INTERVAL", "100"),
-        )
-    ),
-    "VLLM_TURBOQUANT_PROFILE_FILE": lambda: os.getenv(
-        "VLLM_TURBOQUANT_PROFILE_FILE",
-        os.getenv("VLLM_KV_CACHE_STAGE_PROFILE_FILE"),
+        "VLLM_KV_CACHE_STAGE_PROFILE_FILE"
     ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(

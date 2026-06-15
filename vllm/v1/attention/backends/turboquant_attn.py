@@ -52,11 +52,11 @@ from vllm.v1.attention.ops.triton_turboquant_decode import (
     triton_turboquant_decode_attention,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
-from vllm.v1.attention.ops.turboquant_profiler import (
+from vllm.v1.attention.ops.kv_cache_stage_profiler import (
     DEQUANT_BULK,
     FLASH_ATTN,
     INVERSE_ROTATE,
-    tq_profile_stage,
+    kv_cache_profile_stage,
 )
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -760,7 +760,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_cached = v_buf[:, :, :alloc_len, :]
 
         grid = (alloc_len, 1 * Hk)
-        with tq_profile_stage(DEQUANT_BULK):
+        with kv_cache_profile_stage(DEQUANT_BULK):
             _tq_full_dequant_kv[grid](
                 kv_cache,
                 block_table,
@@ -794,7 +794,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Inverse-rotate MSE keys back to original space
         if not self.tq_config.key_fp8:
-            with tq_profile_stage(INVERSE_ROTATE):
+            with kv_cache_profile_stage(INVERSE_ROTATE):
                 # fp16 matmul for rotation (2× less bandwidth, uses fp16 TC)
                 Pi_half = layer._tq_Pi_half
                 k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
@@ -831,7 +831,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             self._cu_2_k[1:2] = seq_len
             cu_seqlens_q = self._cu_2_q
             cu_seqlens_k = self._cu_2_k
-            with tq_profile_stage(FLASH_ATTN):
+            with kv_cache_profile_stage(FLASH_ATTN):
                 return self._flash_attn_varlen(
                     q=query,
                     k=k_full,

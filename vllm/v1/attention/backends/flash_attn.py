@@ -31,7 +31,7 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.attention.ops.turboquant_profiler import (
+from vllm.v1.attention.ops.kv_cache_stage_profiler import (
     STORE_KERNEL,
     attention_stage_for_query_len,
     flash_attention_profile_stage,
