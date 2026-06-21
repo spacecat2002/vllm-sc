@@ -41,7 +41,9 @@ import argparse
 import dataclasses
 import json
 import random
+import sys
 import time
+import traceback
 
 from transformers import PreTrainedTokenizerBase
 
@@ -81,13 +83,26 @@ def _prefix_cache_stats_from_outputs(
 
 
 @dataclasses.dataclass
+class GenerationSummary:
+    num_requests: int
+    expected_requests: int
+    total_prompt_tokens: int
+    total_output_tokens: int
+    total_cached_tokens: int
+    avg_prompt_tokens: float
+    finish_reasons: dict[str, int]
+
+
+@dataclasses.dataclass
 class PrefixCacheHitRateResult:
     model: str
     hits: int
     queries: int
     hit_rate: float | None
     source: str
-    elapsed_s: float
+    load_s: float
+    generate_s: float
+    summary: GenerationSummary
 
 
 def get_prefix_cache_hit_rate(
@@ -114,6 +129,86 @@ def get_prefix_cache_hit_rate(
     return hits, queries, hits / queries * 100, source
 
 
+def _prompt_token_lengths(model: str, prompts: list[str]) -> list[int]:
+    tokenizer = get_tokenizer(model, trust_remote_code=True)
+    return [len(tokenizer.encode(prompt)) for prompt in prompts]
+
+
+def _summarize_outputs(
+    outputs: list[RequestOutput], expected_requests: int
+) -> GenerationSummary:
+    total_prompt_tokens = 0
+    total_output_tokens = 0
+    total_cached_tokens = 0
+    finish_reasons: dict[str, int] = {}
+    for output in outputs:
+        if output.prompt_token_ids is not None:
+            total_prompt_tokens += len(output.prompt_token_ids)
+        if output.num_cached_tokens is not None:
+            total_cached_tokens += output.num_cached_tokens
+        if output.outputs:
+            completion = output.outputs[0]
+            total_output_tokens += len(completion.token_ids)
+            reason = completion.finish_reason or "unknown"
+            finish_reasons[reason] = finish_reasons.get(reason, 0) + 1
+    num_requests = len(outputs)
+    avg_prompt_tokens = (
+        total_prompt_tokens / num_requests if num_requests > 0 else 0.0
+    )
+    return GenerationSummary(
+        num_requests=num_requests,
+        expected_requests=expected_requests,
+        total_prompt_tokens=total_prompt_tokens,
+        total_output_tokens=total_output_tokens,
+        total_cached_tokens=total_cached_tokens,
+        avg_prompt_tokens=avg_prompt_tokens,
+        finish_reasons=finish_reasons,
+    )
+
+
+def _print_generation_summary(
+    model: str,
+    summary: GenerationSummary,
+    *,
+    expected_avg_prompt_tokens: float | None = None,
+) -> None:
+    print(
+        f"Requests: {summary.num_requests}/{summary.expected_requests}, "
+        f"prompt tokens: {summary.total_prompt_tokens} "
+        f"(avg {summary.avg_prompt_tokens:.1f}), "
+        f"output tokens: {summary.total_output_tokens}, "
+        f"cached tokens: {summary.total_cached_tokens}",
+        flush=True,
+    )
+    if summary.finish_reasons:
+        print(f"Finish reasons: {summary.finish_reasons}", flush=True)
+
+    if summary.num_requests != summary.expected_requests:
+        print(
+            f"WARNING: expected {summary.expected_requests} outputs but got "
+            f"{summary.num_requests}. Results may be invalid.",
+            flush=True,
+        )
+    if summary.total_output_tokens == 0:
+        print(
+            "WARNING: zero output tokens generated. "
+            "The run likely did not perform real decoding.",
+            flush=True,
+        )
+    if (
+        expected_avg_prompt_tokens is not None
+        and summary.avg_prompt_tokens < expected_avg_prompt_tokens * 0.5
+    ):
+        print(
+            f"WARNING: avg prompt length for {model} is "
+            f"{summary.avg_prompt_tokens:.1f} tokens, much shorter than the "
+            f"{expected_avg_prompt_tokens:.1f} tokens sampled for --model. "
+            "Cross-model text prompts often re-tokenize to very different "
+            "lengths. Use --fair-compare to sample per model.",
+            flush=True,
+        )
+
+
 def print_prefix_cache_hit_rate(llm: LLM, outputs: list[RequestOutput]) -> None:
     hits, queries, hit_rate, source = get_prefix_cache_hit_rate(llm, outputs)
     if hit_rate is None:
@@ -127,6 +222,11 @@ def print_prefix_cache_hit_rate(llm: LLM, outputs: list[RequestOutput]) -> None:
 
 
 def _destroy_llm(llm: LLM) -> None:
+    print("Shutting down engine and releasing GPU memory...", flush=True)
+    try:
+        llm.llm_engine.engine_core.shutdown()
+    except Exception as exc:
+        print(f"Warning: engine shutdown failed: {exc}", flush=True)
     del llm
     cleanup_dist_env_and_memory()
 
@@ -136,35 +236,74 @@ def benchmark_model(
     args: argparse.Namespace,
     prompts: list[str],
     sampling_params: SamplingParams,
+    *,
+    expected_avg_prompt_tokens: float | None = None,
 ) -> PrefixCacheHitRateResult:
     engine_args = EngineArgs.from_cli_args(args)
     engine_args.model = model
+    # LLM() defaults disable_log_stats=True; keep stats on for benchmark visibility.
+    engine_args.disable_log_stats = False
 
-    print(f"------ Model: {model} ------")
+    prompt_lens = _prompt_token_lengths(model, prompts)
+    print(
+        f"\n------ Model: {model} ------\n"
+        f"Prompt token lengths for this model: "
+        f"avg={sum(prompt_lens) / len(prompt_lens):.1f}, "
+        f"min={min(prompt_lens)}, max={max(prompt_lens)}",
+        flush=True,
+    )
+
+    print("Loading model (this may take a while)...", flush=True)
+    load_start = time.time()
     llm = LLM.from_engine_args(engine_args)
+    load_s = time.time() - load_start
+    print(f"Model loaded in {load_s:.2f}s. Generating {len(prompts)} prompts...", flush=True)
 
-    start_time = time.time()
+    generate_start = time.time()
     outputs = llm.generate(prompts, sampling_params=sampling_params)
-    elapsed_s = time.time() - start_time
+    generate_s = time.time() - generate_start
+
+    summary = _summarize_outputs(outputs, expected_requests=len(prompts))
+    _print_generation_summary(
+        model,
+        summary,
+        expected_avg_prompt_tokens=expected_avg_prompt_tokens,
+    )
+
+    if llm.llm_engine.log_stats:
+        # Force one stats log. Otherwise "Avg prompt throughput" only appears
+        # every VLLM_LOG_STATS_INTERVAL seconds (default: 10s).
+        llm.llm_engine.do_log_stats()
 
     hits, queries, hit_rate, source = get_prefix_cache_hit_rate(llm, outputs)
-    print(f"cost time {elapsed_s:.2f}s")
+    print(
+        f"Generate time {generate_s:.2f}s, load time {load_s:.2f}s, "
+        f"total {load_s + generate_s:.2f}s",
+        flush=True,
+    )
     if hit_rate is None:
-        print("Prefix cache hit rate: N/A (prefix caching disabled or no queries)")
+        print(
+            "Prefix cache hit rate: N/A (prefix caching disabled or no queries)",
+            flush=True,
+        )
     else:
         print(
             f"Prefix cache hit rate: {hit_rate:.1f}% "
-            f"({hits}/{queries} tokens, from {source})"
+            f"({hits}/{queries} tokens, from {source})",
+            flush=True,
         )
 
     _destroy_llm(llm)
+    print(f"Finished benchmark for {model}.", flush=True)
     return PrefixCacheHitRateResult(
         model=model,
         hits=hits,
         queries=queries,
         hit_rate=hit_rate,
         source=source,
-        elapsed_s=elapsed_s,
+        load_s=load_s,
+        generate_s=generate_s,
+        summary=summary,
     )
 
 
@@ -178,7 +317,12 @@ def print_model_comparison(results: list[PrefixCacheHitRateResult]) -> None:
                 f"{result.hit_rate:.1f}% "
                 f"({result.hits}/{result.queries} tokens, from {result.source})"
             )
-        print(f"{result.model}: {hit_rate_str}, cost {result.elapsed_s:.2f}s")
+        print(
+            f"{result.model}: {hit_rate_str}, "
+            f"generate {result.generate_s:.2f}s, load {result.load_s:.2f}s, "
+            f"prompt tokens {result.summary.total_prompt_tokens}, "
+            f"output tokens {result.summary.total_output_tokens}"
+        )
 
     valid_results = [result for result in results if result.hit_rate is not None]
     if len(valid_results) == 2:
@@ -188,8 +332,59 @@ def print_model_comparison(results: list[PrefixCacheHitRateResult]) -> None:
             f"{delta:+.1f}% vs {valid_results[1].model}"
         )
     print(
-        "Note: prompts are identical text; token counts may differ across tokenizers."
+        "Note: unless --fair-compare is set, all models share the same text "
+        "prompts but may tokenize them to very different lengths."
     )
+
+
+def prepare_requests(args: argparse.Namespace, model: str) -> list[Request]:
+    tokenizer = get_tokenizer(model, trust_remote_code=True)
+    input_length_range = tuple(map(int, args.input_length_range.split(":")))
+    if args.dataset_path is not None:
+        if args.prefix_len > 0:
+            raise ValueError(
+                "prefix-len is not supported when dataset-path is provided."
+            )
+        print(f"Start to sample {args.num_prompts} prompts from {args.dataset_path}")
+        return sample_requests_from_dataset(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            input_length_range=input_length_range,
+            fixed_output_len=args.output_len,
+        )
+
+    print(f"Start to sample {args.num_prompts} prompts from random")
+    return sample_requests_from_random(
+        num_requests=args.num_prompts,
+        tokenizer=tokenizer,
+        input_length_range=input_length_range,
+        fixed_output_len=args.output_len,
+        prefix_len=args.prefix_len,
+    )
+
+
+def prepare_prompts(
+    args: argparse.Namespace, model: str | None = None
+) -> tuple[list[str], float]:
+    sample_model = model or args.model
+    random.seed(args.seed)
+    filtered_requests = prepare_requests(args, sample_model)
+
+    # Print some helpful stats of the requests.
+    print(f"Sampled {len(filtered_requests)} requests using {sample_model}.")
+    prompt_lens = [req.prompt_len for req in filtered_requests]
+    avg_prompt_len = sum(prompt_lens) / len(prompt_lens)
+    print(f"Average input length: {avg_prompt_len}")
+    print(f"P50 input length: {sorted(prompt_lens)[len(prompt_lens) // 2]}")
+    print(f"Min Prompt Length: {min(prompt_lens)}")
+    print(f"Max Prompt Length: {max(prompt_lens)}")
+
+    print("Testing filtered requests")
+    prompts = repeat_and_sort_requests(
+        filtered_requests, repeat_count=args.repeat_count, sort=args.sort
+    )
+    return prompts, avg_prompt_len
 
 
 @dataclasses.dataclass
@@ -295,52 +490,13 @@ def repeat_and_sort_requests(
     return [req.prompt for req in repeated_requests]
 
 
-def prepare_prompts(args: argparse.Namespace) -> list[str]:
-    tokenizer = get_tokenizer(args.model, trust_remote_code=True)
-    input_length_range = tuple(map(int, args.input_length_range.split(":")))
-    random.seed(args.seed)
-    if args.dataset_path is not None:
-        if args.prefix_len > 0:
-            raise ValueError(
-                "prefix-len is not supported when dataset-path is provided."
-            )
-        print(f"Start to sample {args.num_prompts} prompts from {args.dataset_path}")
-        filtered_requests = sample_requests_from_dataset(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            input_length_range=input_length_range,
-            fixed_output_len=args.output_len,
-        )
-    else:
-        print(f"Start to sample {args.num_prompts} prompts from random")
-        filtered_requests = sample_requests_from_random(
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            input_length_range=input_length_range,
-            fixed_output_len=args.output_len,
-            prefix_len=args.prefix_len,
-        )
-
-    # Print some helpful stats of the requests.
-    print(f"Sampled {len(filtered_requests)} requests.")
-    prompt_lens = [req.prompt_len for req in filtered_requests]
-    print(f"Average input length: {sum(prompt_lens) / len(prompt_lens)}")
-    print(f"P50 input length: {sorted(prompt_lens)[len(prompt_lens) // 2]}")
-    print(f"Min Prompt Length: {min(prompt_lens)}")
-    print(f"Max Prompt Length: {max(prompt_lens)}")
-
-    print("Testing filtered requests")
-    return repeat_and_sort_requests(
-        filtered_requests, repeat_count=args.repeat_count, sort=args.sort
-    )
-
-
 def main(args):
     if args.compare_model is not None and args.compare_model == args.model:
         raise ValueError("--compare-model must differ from --model")
 
-    prompts = prepare_prompts(args)
+    models = [args.model]
+    if args.compare_model is not None:
+        models.append(args.compare_model)
 
     sampling_params = SamplingParams(
         temperature=0,
@@ -348,17 +504,48 @@ def main(args):
         detokenize=not args.disable_detokenize,
     )
 
-    models = [args.model]
-    if args.compare_model is not None:
-        models.append(args.compare_model)
+    shared_prompts: list[str] | None = None
+    expected_avg_prompt_tokens: float | None = None
+    if args.compare_model is None or not args.fair_compare:
+        shared_prompts, expected_avg_prompt_tokens = prepare_prompts(args)
 
-    print("------start generating------")
-    results = [
-        benchmark_model(model, args, prompts, sampling_params) for model in models
-    ]
+    print("------start generating------", flush=True)
+    results: list[PrefixCacheHitRateResult] = []
+    for model in models:
+        try:
+            if args.fair_compare and args.compare_model is not None:
+                print(f"\nSampling prompts for {model} (--fair-compare)", flush=True)
+                prompts, expected_avg = prepare_prompts(args, model=model)
+                expected_avg_prompt_tokens = expected_avg
+            else:
+                assert shared_prompts is not None
+                prompts = shared_prompts
+            results.append(
+                benchmark_model(
+                    model,
+                    args,
+                    prompts,
+                    sampling_params,
+                    expected_avg_prompt_tokens=expected_avg_prompt_tokens,
+                )
+            )
+        except Exception:
+            print(
+                f"ERROR: benchmark failed for model {model}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc()
+            if len(models) == 1:
+                raise
 
     if len(results) > 1:
         print_model_comparison(results)
+    elif len(models) > 1 and len(results) < len(models):
+        print(
+            "\nComparison skipped: not all models completed successfully.",
+            flush=True,
+        )
 
 
 def create_argument_parser():
@@ -409,6 +596,17 @@ def create_argument_parser():
             "Optional second model to benchmark on the same prompts. "
             "Models are run sequentially and their prefix cache hit rates "
             "are compared at the end."
+        ),
+    )
+    parser.add_argument(
+        "--fair-compare",
+        action="store_true",
+        help=(
+            "When comparing two models, sample prompts separately with each "
+            "model's tokenizer so both sides target the same input-length-range. "
+            "Without this flag, both models reuse the same text prompts, which "
+            "often re-tokenize to very different lengths and makes runtime "
+            "comparison misleading."
         ),
     )
     parser.add_argument(
