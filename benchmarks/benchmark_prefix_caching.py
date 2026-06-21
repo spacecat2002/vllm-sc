@@ -15,6 +15,15 @@ Fixed example usage:
         --repeat-count 100 \
         --input-length-range 128:256
 
+Compare two models on the same prompts:
+    python benchmark_prefix_caching.py \
+        --model Qwen/Qwen2-7B-Instruct \
+        --compare-model Qwen/Qwen3-8B \
+        --enable-prefix-caching \
+        --num-prompts 10 \
+        --repeat-count 5 \
+        --input-length-range 128:256
+
 ShareGPT example usage:
     # This command samples 20 prompts with input lengths
     # between 128 and 256 tokens from the ShareGPT dataset,
@@ -28,6 +37,7 @@ ShareGPT example usage:
         --input-length-range 128:256
 """
 
+import argparse
 import dataclasses
 import json
 import random
@@ -36,6 +46,7 @@ import time
 from transformers import PreTrainedTokenizerBase
 
 from vllm import LLM, RequestOutput, SamplingParams
+from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.metrics.reader import Counter, Metric
@@ -69,7 +80,19 @@ def _prefix_cache_stats_from_outputs(
     return hits, queries
 
 
-def print_prefix_cache_hit_rate(llm: LLM, outputs: list[RequestOutput]) -> None:
+@dataclasses.dataclass
+class PrefixCacheHitRateResult:
+    model: str
+    hits: int
+    queries: int
+    hit_rate: float | None
+    source: str
+    elapsed_s: float
+
+
+def get_prefix_cache_hit_rate(
+    llm: LLM, outputs: list[RequestOutput]
+) -> tuple[int, int, float | None, str]:
     hits = 0
     queries = 0
     source = "engine metrics"
@@ -86,28 +109,87 @@ def print_prefix_cache_hit_rate(llm: LLM, outputs: list[RequestOutput]) -> None:
         source = "request outputs"
 
     if queries == 0:
+        return 0, 0, None, source
+
+    return hits, queries, hits / queries * 100, source
+
+
+def print_prefix_cache_hit_rate(llm: LLM, outputs: list[RequestOutput]) -> None:
+    hits, queries, hit_rate, source = get_prefix_cache_hit_rate(llm, outputs)
+    if hit_rate is None:
         print("Prefix cache hit rate: N/A (prefix caching disabled or no queries)")
         return
 
-    hit_rate = hits / queries * 100
     print(
         f"Prefix cache hit rate: {hit_rate:.1f}% "
         f"({hits}/{queries} tokens, from {source})"
     )
 
 
-def test_prefix(
-    llm: LLM | None = None,
-    sampling_params: SamplingParams | None = None,
-    prompts: list[str] | None = None,
-) -> list[RequestOutput]:
+def _destroy_llm(llm: LLM) -> None:
+    del llm
+    cleanup_dist_env_and_memory()
+
+
+def benchmark_model(
+    model: str,
+    args: argparse.Namespace,
+    prompts: list[str],
+    sampling_params: SamplingParams,
+) -> PrefixCacheHitRateResult:
+    engine_args = EngineArgs.from_cli_args(args)
+    engine_args.model = model
+
+    print(f"------ Model: {model} ------")
+    llm = LLM.from_engine_args(engine_args)
+
     start_time = time.time()
-
     outputs = llm.generate(prompts, sampling_params=sampling_params)
+    elapsed_s = time.time() - start_time
 
-    end_time = time.time()
-    print(f"cost time {end_time - start_time}")
-    return outputs
+    hits, queries, hit_rate, source = get_prefix_cache_hit_rate(llm, outputs)
+    print(f"cost time {elapsed_s:.2f}s")
+    if hit_rate is None:
+        print("Prefix cache hit rate: N/A (prefix caching disabled or no queries)")
+    else:
+        print(
+            f"Prefix cache hit rate: {hit_rate:.1f}% "
+            f"({hits}/{queries} tokens, from {source})"
+        )
+
+    _destroy_llm(llm)
+    return PrefixCacheHitRateResult(
+        model=model,
+        hits=hits,
+        queries=queries,
+        hit_rate=hit_rate,
+        source=source,
+        elapsed_s=elapsed_s,
+    )
+
+
+def print_model_comparison(results: list[PrefixCacheHitRateResult]) -> None:
+    print("\n====== Prefix cache hit rate comparison ======")
+    for result in results:
+        if result.hit_rate is None:
+            hit_rate_str = "N/A"
+        else:
+            hit_rate_str = (
+                f"{result.hit_rate:.1f}% "
+                f"({result.hits}/{result.queries} tokens, from {result.source})"
+            )
+        print(f"{result.model}: {hit_rate_str}, cost {result.elapsed_s:.2f}s")
+
+    valid_results = [result for result in results if result.hit_rate is not None]
+    if len(valid_results) == 2:
+        delta = valid_results[0].hit_rate - valid_results[1].hit_rate
+        print(
+            f"Difference: {valid_results[0].model} "
+            f"{delta:+.1f}% vs {valid_results[1].model}"
+        )
+    print(
+        "Note: prompts are identical text; token counts may differ across tokenizers."
+    )
 
 
 @dataclasses.dataclass
@@ -213,7 +295,7 @@ def repeat_and_sort_requests(
     return [req.prompt for req in repeated_requests]
 
 
-def main(args):
+def prepare_prompts(args: argparse.Namespace) -> list[str]:
     tokenizer = get_tokenizer(args.model, trust_remote_code=True)
     input_length_range = tuple(map(int, args.input_length_range.split(":")))
     random.seed(args.seed)
@@ -248,9 +330,17 @@ def main(args):
     print(f"Min Prompt Length: {min(prompt_lens)}")
     print(f"Max Prompt Length: {max(prompt_lens)}")
 
-    engine_args = EngineArgs.from_cli_args(args)
+    print("Testing filtered requests")
+    return repeat_and_sort_requests(
+        filtered_requests, repeat_count=args.repeat_count, sort=args.sort
+    )
 
-    llm = LLM.from_engine_args(engine_args)
+
+def main(args):
+    if args.compare_model is not None and args.compare_model == args.model:
+        raise ValueError("--compare-model must differ from --model")
+
+    prompts = prepare_prompts(args)
 
     sampling_params = SamplingParams(
         temperature=0,
@@ -258,18 +348,17 @@ def main(args):
         detokenize=not args.disable_detokenize,
     )
 
-    print("Testing filtered requests")
-    prompts = repeat_and_sort_requests(
-        filtered_requests, repeat_count=args.repeat_count, sort=args.sort
-    )
+    models = [args.model]
+    if args.compare_model is not None:
+        models.append(args.compare_model)
 
     print("------start generating------")
-    outputs = test_prefix(
-        llm=llm,
-        prompts=prompts,
-        sampling_params=sampling_params,
-    )
-    print_prefix_cache_hit_rate(llm, outputs)
+    results = [
+        benchmark_model(model, args, prompts, sampling_params) for model in models
+    ]
+
+    if len(results) > 1:
+        print_model_comparison(results)
 
 
 def create_argument_parser():
@@ -311,6 +400,16 @@ def create_argument_parser():
         "added to the input prompt. The input-length-range will "
         "subtract this length when filtering prompts. Only used "
         "when dataset-path is not provided.",
+    )
+    parser.add_argument(
+        "--compare-model",
+        type=str,
+        default=None,
+        help=(
+            "Optional second model to benchmark on the same prompts. "
+            "Models are run sequentially and their prefix cache hit rates "
+            "are compared at the end."
+        ),
     )
     parser.add_argument(
         "--disable-detokenize",
