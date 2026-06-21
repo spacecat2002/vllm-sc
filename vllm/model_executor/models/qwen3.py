@@ -47,6 +47,16 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.ops.kv_cache_stage_profiler import (
+    MLP,
+    O_PROJ,
+    QK_NORM,
+    QKV_PROJ,
+    RMSNORM_IN,
+    RMSNORM_POST,
+    ROTARY_EMB,
+    kv_cache_profile_stage,
+)
 
 from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2MLP as Qwen3MLP
@@ -147,18 +157,26 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+        layer = self.attn
+        with kv_cache_profile_stage(QKV_PROJ, layer=layer):
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        with kv_cache_profile_stage(QK_NORM, layer=layer):
+            q_by_head = q.view(
+                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+            )
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+            )
+            k_by_head = self.k_norm(k_by_head)
+            k = k_by_head.view(k.shape)
+        with kv_cache_profile_stage(ROTARY_EMB, layer=layer):
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        with kv_cache_profile_stage(O_PROJ, layer=layer):
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -219,20 +237,26 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        layer = self.self_attn.attn
+        with kv_cache_profile_stage(RMSNORM_IN, layer=layer):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        with kv_cache_profile_stage(RMSNORM_POST, layer=layer):
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        with kv_cache_profile_stage(MLP, layer=layer):
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 

@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Optional CUDA-event profiler for KV-cache stage breakdown.
+"""Optional CUDA-event profiler for per-stage GPU breakdown.
 
-Works for both TurboQuant and standard (e.g. FlashAttention) backends so
-quantized vs baseline runs produce the same stage table.
+Profiles KV-cache / attention-backend stages and (for supported models) decoder
+layer compute such as QKV projection, MLP, and RMSNorm.
 
 Enable with ``VLLM_KV_CACHE_STAGE_PROFILE=N`` (``N > 0``).  The value is the
 flush interval in engine steps (``1`` = every step).  Results append to
 ``VLLM_KV_CACHE_STAGE_PROFILE_FILE`` when set.
 
-Stage mapping (baseline FlashAttention vs TurboQuant):
+KV / attention-backend stages (baseline FlashAttention vs TurboQuant):
 
 +------------------+---------------------------+---------------------------+
 | Stage            | Baseline (auto/bf16)      | TurboQuant                |
@@ -24,6 +24,20 @@ Stage mapping (baseline FlashAttention vs TurboQuant):
 | flash_attn       | flash_attn (prefill)      | flash_attn (prefill)      |
 +------------------+---------------------------+---------------------------+
 
+Model stages (Qwen2/Qwen3 decoder layers):
+
++------------------+------------------------------------------+
+| Stage            | Kernels                                  |
++==================+==========================================+
+| rmsnorm_in       | input RMSNorm (+ fused residual)         |
+| qkv_proj         | QKV parallel linear                      |
+| qk_norm          | per-head Q/K RMSNorm (Qwen3, optional Q2)|
+| rotary_emb       | RoPE                                     |
+| o_proj           | attention output projection              |
+| rmsnorm_post     | post-attention RMSNorm (+ fused residual)|
+| mlp              | gate/up + activation + down              |
++------------------+------------------------------------------+
+
 Pair with ``VLLM_CUSTOM_SCOPES_FOR_PROFILING=1`` to see ``kv_stage:*`` scopes
 in torch profiler Chrome traces.
 """
@@ -34,7 +48,7 @@ import json
 import threading
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator
 
 import torch
@@ -46,7 +60,7 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# Stage names shared across TurboQuant and baseline backends.
+# KV-cache / attention-backend stages.
 STORE_PREPROCESS = "store_preprocess"
 STORE_KERNEL = "store_kernel"
 DECODE_Q_ROTATE = "decode_q_rotate"
@@ -56,7 +70,16 @@ DEQUANT_BULK = "dequant_bulk"
 INVERSE_ROTATE = "inverse_rotate"
 FLASH_ATTN = "flash_attn"
 
-_ALL_STAGES = (
+# Decoder-layer compute stages (Qwen2/Qwen3).
+RMSNORM_IN = "rmsnorm_in"
+QKV_PROJ = "qkv_proj"
+QK_NORM = "qk_norm"
+ROTARY_EMB = "rotary_emb"
+O_PROJ = "o_proj"
+RMSNORM_POST = "rmsnorm_post"
+MLP = "mlp"
+
+_STAGE_ORDER: tuple[str, ...] = (
     STORE_PREPROCESS,
     STORE_KERNEL,
     DECODE_Q_ROTATE,
@@ -65,6 +88,13 @@ _ALL_STAGES = (
     DEQUANT_BULK,
     INVERSE_ROTATE,
     FLASH_ATTN,
+    RMSNORM_IN,
+    QKV_PROJ,
+    QK_NORM,
+    ROTARY_EMB,
+    O_PROJ,
+    RMSNORM_POST,
+    MLP,
 )
 
 _enabled: bool | None = None
@@ -153,28 +183,11 @@ def should_profile_layer(layer: object | None = None) -> bool:
 class KVCacheStageStats:
     """Aggregated milliseconds per stage (mean over recorded samples)."""
 
-    store_preprocess_ms: float = 0.0
-    store_kernel_ms: float = 0.0
-    decode_q_rotate_ms: float = 0.0
-    decode_stage1_ms: float = 0.0
-    decode_stage2_ms: float = 0.0
-    dequant_bulk_ms: float = 0.0
-    inverse_rotate_ms: float = 0.0
-    flash_attn_ms: float = 0.0
+    stage_ms: dict[str, float] = field(default_factory=dict)
     sample_count: int = 0
 
     def to_dict(self) -> dict[str, float | int]:
-        return {
-            STORE_PREPROCESS: self.store_preprocess_ms,
-            STORE_KERNEL: self.store_kernel_ms,
-            DECODE_Q_ROTATE: self.decode_q_rotate_ms,
-            DECODE_STAGE1: self.decode_stage1_ms,
-            DECODE_STAGE2: self.decode_stage2_ms,
-            DEQUANT_BULK: self.dequant_bulk_ms,
-            INVERSE_ROTATE: self.inverse_rotate_ms,
-            FLASH_ATTN: self.flash_attn_ms,
-            "sample_count": self.sample_count,
-        }
+        return {**self.stage_ms, "sample_count": self.sample_count}
 
 
 class KVCacheStageProfiler:
@@ -216,17 +229,8 @@ class KVCacheStageProfiler:
 
         counts = [len(v) for v in self._samples.values()]
         sample_count = max(counts) if counts else 0
-        return KVCacheStageStats(
-            store_preprocess_ms=_mean(STORE_PREPROCESS),
-            store_kernel_ms=_mean(STORE_KERNEL),
-            decode_q_rotate_ms=_mean(DECODE_Q_ROTATE),
-            decode_stage1_ms=_mean(DECODE_STAGE1),
-            decode_stage2_ms=_mean(DECODE_STAGE2),
-            dequant_bulk_ms=_mean(DEQUANT_BULK),
-            inverse_rotate_ms=_mean(INVERSE_ROTATE),
-            flash_attn_ms=_mean(FLASH_ATTN),
-            sample_count=sample_count,
-        )
+        stage_ms = {name: _mean(name) for name in _STAGE_ORDER}
+        return KVCacheStageStats(stage_ms=stage_ms, sample_count=sample_count)
 
     def _emit(self, stats: KVCacheStageStats, counts: dict[str, int]) -> None:
         scope = (
@@ -235,30 +239,15 @@ class KVCacheStageProfiler:
             else "layer-call"
         )
         lines = [
-            "KV cache stage breakdown (mean ms per "
+            "Stage breakdown (mean ms per "
             f"{scope}, over last {self._interval} engine step(s), "
             f"max n={stats.sample_count}):",
         ]
-        active_stages = [stage for stage in _ALL_STAGES if counts.get(stage, 0) > 0]
-        stats_dict = stats.to_dict()
+        active_stages = [stage for stage in _STAGE_ORDER if counts.get(stage, 0) > 0]
         for stage in active_stages:
-            val = stats_dict[stage]
+            val = stats.stage_ms[stage]
             n = counts[stage]
             lines.append(f"  {stage}: {val:.6f} ms (n={n})")
-
-        # store_stages = (STORE_PREPROCESS, STORE_KERNEL)
-        # if any(counts.get(stage, 0) > 0 for stage in store_stages):
-        #     store_total = stats.store_preprocess_ms + stats.store_kernel_ms
-        #     lines.append(f"  store_total: {store_total:.6f} ms")
-
-        # decode_stages = (DECODE_Q_ROTATE, DECODE_STAGE1, DECODE_STAGE2)
-        # if any(counts.get(stage, 0) > 0 for stage in decode_stages):
-        #     decode_total = (
-        #         stats.decode_q_rotate_ms
-        #         + stats.decode_stage1_ms
-        #         + stats.decode_stage2_ms
-        #     )
-        #     lines.append(f"  decode_total: {decode_total:.6f} ms")
 
         msg = "\n".join(lines)
         logger.info(msg)
@@ -266,10 +255,7 @@ class KVCacheStageProfiler:
         profile_file = envs.VLLM_KV_CACHE_STAGE_PROFILE_FILE
         if profile_file:
             record = {
-                "stages": {
-                    stage: stats_dict[stage]
-                    for stage in active_stages
-                },
+                "stages": {stage: stats.stage_ms[stage] for stage in active_stages},
                 "sample_count": stats.sample_count,
             }
             try:
@@ -301,7 +287,7 @@ def flash_attention_profile_stage(
 def kv_cache_profile_stage(
     name: str, layer: object | None = None
 ) -> Iterator[None]:
-    """Context manager: time one KV-cache stage on the current CUDA stream."""
+    """Context manager: time one GPU stage on the current CUDA stream."""
     if not should_profile_layer(layer):
         yield
         return
@@ -330,7 +316,7 @@ def kv_cache_profile_scope(
 
 
 def notify_kv_cache_stage_engine_step() -> None:
-    """Flush KV-cache stage stats once per completed engine forward step."""
+    """Flush stage stats once per completed engine forward step."""
     if not is_kv_cache_stage_profiling_enabled():
         return
     get_kv_cache_stage_profiler().notify_engine_step()

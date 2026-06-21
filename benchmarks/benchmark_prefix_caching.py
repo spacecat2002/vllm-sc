@@ -35,9 +35,10 @@ import time
 
 from transformers import PreTrainedTokenizerBase
 
-from vllm import LLM, SamplingParams
+from vllm import LLM, RequestOutput, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.metrics.reader import Counter, Metric
 
 try:
     from vllm.tokenizers import get_tokenizer
@@ -47,13 +48,66 @@ except ImportError:
 PROMPT = "You are a helpful assistant in recognizes the content of tables in markdown format. Here is a table as fellows. You need to answer my question about the table.\n# Table\n|Opening|Opening|Sl. No.|Film|Cast|Director|Music Director|Notes|\n|----|----|----|----|----|----|----|----|\n|J A N|9|1|Agni Pushpam|Jayabharathi, Kamalahasan|Jeassy|M. K. Arjunan||\n|J A N|16|2|Priyamvada|Mohan Sharma, Lakshmi, KPAC Lalitha|K. S. Sethumadhavan|V. Dakshinamoorthy||\n|J A N|23|3|Yakshagaanam|Madhu, Sheela|Sheela|M. S. Viswanathan||\n|J A N|30|4|Paalkkadal|Sheela, Sharada|T. K. Prasad|A. T. Ummer||\n|F E B|5|5|Amma|Madhu, Srividya|M. Krishnan Nair|M. K. Arjunan||\n|F E B|13|6|Appooppan|Thikkurissi Sukumaran Nair, Kamal Haasan|P. Bhaskaran|M. S. Baburaj||\n|F E B|20|7|Srishti|Chowalloor Krishnankutty, Ravi Alummoodu|K. T. Muhammad|M. S. Baburaj||\n|F E B|20|8|Vanadevatha|Prem Nazir, Madhubala|Yusufali Kechery|G. Devarajan||\n|F E B|27|9|Samasya|Madhu, Kamalahaasan|K. Thankappan|Shyam||\n|F E B|27|10|Yudhabhoomi|K. P. Ummer, Vidhubala|Crossbelt Mani|R. K. Shekhar||\n|M A R|5|11|Seemantha Puthran|Prem Nazir, Jayabharathi|A. B. Raj|M. K. Arjunan||\n|M A R|12|12|Swapnadanam|Rani Chandra, Dr. Mohandas|K. G. George|Bhaskar Chandavarkar||\n|M A R|19|13|Thulavarsham|Prem Nazir, sreedevi, Sudheer|N. Sankaran Nair|V. Dakshinamoorthy||\n|M A R|20|14|Aruthu|Kaviyoor Ponnamma, Kamalahasan|Ravi|G. Devarajan||\n|M A R|26|15|Swimming Pool|Kamal Haasan, M. G. Soman|J. Sasikumar|M. K. Arjunan||\n\n# Question\nWhat' s the content in the (1,1) cells\n"  # noqa: E501
 
 
-def test_prefix(llm=None, sampling_params=None, prompts=None):
+def _sum_counter_value(metrics: list[Metric], name: str) -> int:
+    return sum(
+        metric.value
+        for metric in metrics
+        if isinstance(metric, Counter) and metric.name == name
+    )
+
+
+def _prefix_cache_stats_from_outputs(
+    outputs: list[RequestOutput],
+) -> tuple[int, int]:
+    queries = 0
+    hits = 0
+    for output in outputs:
+        if output.prompt_token_ids is not None:
+            queries += len(output.prompt_token_ids)
+        if output.num_cached_tokens is not None:
+            hits += output.num_cached_tokens
+    return hits, queries
+
+
+def print_prefix_cache_hit_rate(llm: LLM, outputs: list[RequestOutput]) -> None:
+    hits = 0
+    queries = 0
+    source = "engine metrics"
+
+    try:
+        metrics = llm.get_metrics()
+        queries = _sum_counter_value(metrics, "vllm:prefix_cache_queries")
+        hits = _sum_counter_value(metrics, "vllm:prefix_cache_hits")
+    except AssertionError:
+        source = "request outputs"
+
+    if queries == 0:
+        hits, queries = _prefix_cache_stats_from_outputs(outputs)
+        source = "request outputs"
+
+    if queries == 0:
+        print("Prefix cache hit rate: N/A (prefix caching disabled or no queries)")
+        return
+
+    hit_rate = hits / queries * 100
+    print(
+        f"Prefix cache hit rate: {hit_rate:.1f}% "
+        f"({hits}/{queries} tokens, from {source})"
+    )
+
+
+def test_prefix(
+    llm: LLM | None = None,
+    sampling_params: SamplingParams | None = None,
+    prompts: list[str] | None = None,
+) -> list[RequestOutput]:
     start_time = time.time()
 
-    llm.generate(prompts, sampling_params=sampling_params)
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
 
     end_time = time.time()
     print(f"cost time {end_time - start_time}")
+    return outputs
 
 
 @dataclasses.dataclass
@@ -210,11 +264,12 @@ def main(args):
     )
 
     print("------start generating------")
-    test_prefix(
+    outputs = test_prefix(
         llm=llm,
         prompts=prompts,
         sampling_params=sampling_params,
     )
+    print_prefix_cache_hit_rate(llm, outputs)
 
 
 def create_argument_parser():

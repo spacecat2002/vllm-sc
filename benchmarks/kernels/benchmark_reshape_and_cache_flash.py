@@ -137,7 +137,7 @@ def run_benchmark(
 def main(args):
     rows = []
     for layout in ["NHD", "HND"]:
-        for exp in range(1, 17):
+        for exp in range(1, 11):
             n_tok = 2**exp
             lat = run_benchmark(
                 num_tokens=n_tok,
@@ -165,7 +165,7 @@ def main(args):
 if __name__ == "__main__":
     parser = FlexibleArgumentParser()
 
-    parser.add_argument("--num-heads", type=int, default=128)
+    parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument(
         "--head-size",
         type=int,
@@ -173,7 +173,7 @@ if __name__ == "__main__":
         default=128,
     )
     parser.add_argument("--block-size", type=int, choices=[16, 32], default=16)
-    parser.add_argument("--num-blocks", type=int, default=128 * 512)
+    parser.add_argument("--num-blocks", type=int, default=128)
 
     parser.add_argument(
         "--dtype",
