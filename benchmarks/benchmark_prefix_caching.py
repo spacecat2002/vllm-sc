@@ -24,6 +24,15 @@ Compare two models on the same prompts:
         --repeat-count 5 \
         --input-length-range 128:256
 
+Compare two models using one shared raw prompt string:
+    python benchmark_prefix_caching.py \
+        --model Qwen/Qwen2-7B-Instruct \
+        --compare-model Qwen/Qwen3-8B \
+        --use-fixed-prompt \
+        --enable-prefix-caching \
+        --num-prompts 10 \
+        --repeat-count 5
+
 ShareGPT example usage:
     # This command samples 20 prompts with input lengths
     # between 128 and 256 tokens from the ShareGPT dataset,
@@ -392,6 +401,14 @@ def prepare_prompts(
     return prompts, avg_prompt_len
 
 
+def prepare_fixed_prompts(args: argparse.Namespace) -> tuple[list[str], float]:
+    prompts = [PROMPT] * args.num_prompts
+    prompts = prompts * args.repeat_count
+    if args.sort:
+        prompts.sort(key=len)
+    return prompts, -1.0
+
+
 def sample_tokens(tokenizer: PreTrainedTokenizerBase, length: int) -> list[int]:
     vocab = tokenizer.get_vocab()
     all_special_ids = set(tokenizer.all_special_ids)
@@ -504,7 +521,9 @@ def main(args):
 
     shared_prompts: list[str] | None = None
     expected_avg_prompt_tokens: float | None = None
-    if args.compare_model is None or not args.fair_compare:
+    if args.use_fixed_prompt:
+        shared_prompts, expected_avg_prompt_tokens = prepare_fixed_prompts(args)
+    elif args.compare_model is None or not args.fair_compare:
         shared_prompts, expected_avg_prompt_tokens = prepare_prompts(args)
 
     print("------start generating------", flush=True)
@@ -594,6 +613,14 @@ def create_argument_parser():
             "Optional second model to benchmark on the same prompts. "
             "Models are run sequentially and their prefix cache hit rates "
             "are compared at the end."
+        ),
+    )
+    parser.add_argument(
+        "--use-fixed-prompt",
+        action="store_true",
+        help=(
+            "Use the built-in PROMPT string for all requests so each model "
+            "tokenizes the same raw text independently."
         ),
     )
     parser.add_argument(
