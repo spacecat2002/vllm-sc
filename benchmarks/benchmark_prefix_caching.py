@@ -53,6 +53,7 @@ import random
 import sys
 import time
 import traceback
+from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
@@ -73,7 +74,7 @@ PROMPT = "You are a helpful assistant in recognizes the content of tables in mar
 class Request:
     prompt: str
     prompt_len: int
-    output_len: int
+    output_len: int | None
 
 def _sum_counter_value(metrics: list[Metric], name: str) -> int:
     return sum(
@@ -146,6 +147,11 @@ def get_prefix_cache_hit_rate(
 def _prompt_token_lengths(model: str, prompts: list[str]) -> list[int]:
     tokenizer = get_tokenizer(model, trust_remote_code=True)
     return [len(tokenizer.encode(prompt)) for prompt in prompts]
+
+
+def _parse_input_length_range(args: argparse.Namespace) -> tuple[int, int]:
+    min_len_str, max_len_str = args.input_length_range.split(":", maxsplit=1)
+    return int(min_len_str), int(max_len_str)
 
 
 def _summarize_outputs(
@@ -340,7 +346,10 @@ def print_model_comparison(results: list[PrefixCacheHitRateResult]) -> None:
 
     valid_results = [result for result in results if result.hit_rate is not None]
     if len(valid_results) == 2:
-        delta = valid_results[0].hit_rate - valid_results[1].hit_rate
+        first_hit_rate = valid_results[0].hit_rate
+        second_hit_rate = valid_results[1].hit_rate
+        assert first_hit_rate is not None and second_hit_rate is not None
+        delta = first_hit_rate - second_hit_rate
         print(
             f"Difference: {valid_results[0].model} "
             f"{delta:+.1f}% vs {valid_results[1].model}"
@@ -352,8 +361,10 @@ def print_model_comparison(results: list[PrefixCacheHitRateResult]) -> None:
 
 
 def prepare_requests(args: argparse.Namespace, model: str) -> list[Request]:
-    tokenizer = get_tokenizer(model, trust_remote_code=True)
-    input_length_range = tuple(map(int, args.input_length_range.split(":")))
+    tokenizer = cast(
+        PreTrainedTokenizerBase, get_tokenizer(model, trust_remote_code=True)
+    )
+    input_length_range = _parse_input_length_range(args)
     if args.dataset_path is not None:
         if args.prefix_len > 0:
             raise ValueError(
@@ -401,12 +412,48 @@ def prepare_prompts(
     return prompts, avg_prompt_len
 
 
-def prepare_fixed_prompts(args: argparse.Namespace) -> tuple[list[str], float]:
-    prompts = [PROMPT] * args.num_prompts
+def _sample_fixed_prompt_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    input_length_range: tuple[int, int],
+) -> list[int]:
+    min_len, max_len = input_length_range
+    prompt_token_ids = tokenizer(PROMPT).input_ids
+    target_len = random.randint(min_len, max_len)
+
+    if target_len <= len(prompt_token_ids):
+        return prompt_token_ids[:target_len]
+
+    repeat_count = (target_len + len(prompt_token_ids) - 1) // len(prompt_token_ids)
+    return (prompt_token_ids * repeat_count)[:target_len]
+
+
+def prepare_fixed_prompts(
+    args: argparse.Namespace, model: str
+) -> tuple[list[str], float]:
+    tokenizer = cast(
+        PreTrainedTokenizerBase, get_tokenizer(model, trust_remote_code=True)
+    )
+    input_length_range = _parse_input_length_range(args)
+
+    prompts_with_lengths = []
+    for _ in range(args.num_prompts):
+        prompt_token_ids = _sample_fixed_prompt_tokens(tokenizer, input_length_range)
+        prompts_with_lengths.append((len(prompt_token_ids), tokenizer.decode(prompt_token_ids)))
+
+    if args.sort:
+        prompts_with_lengths.sort(key=lambda item: item[0])
+
+    prompts = [prompt for _, prompt in prompts_with_lengths]
+    avg_prompt_len = (
+        sum(prompt_len for prompt_len, _ in prompts_with_lengths)
+        / len(prompts_with_lengths)
+        if prompts_with_lengths
+        else 0.0
+    )
     prompts = prompts * args.repeat_count
     if args.sort:
         prompts.sort(key=len)
-    return prompts, -1.0
+    return prompts, avg_prompt_len
 
 
 def sample_tokens(tokenizer: PreTrainedTokenizerBase, length: int) -> list[int]:
@@ -456,7 +503,7 @@ def sample_requests_from_dataset(
 
         # Tokenize the prompts and completions.
         prompt_token_ids = tokenizer(dataset[i][0]).input_ids
-        prompt = tokenizer.decode(prompt_token_ids)
+        prompt = cast(str, tokenizer.decode(prompt_token_ids))
         completion = dataset[i][1]
         completion_token_ids = tokenizer(completion).input_ids
         prompt_len = len(prompt_token_ids)
@@ -485,7 +532,7 @@ def sample_requests_from_random(
             tokenizer, random.randint(min_len - prefix_len, max_len - prefix_len)
         )
         prompt_token_ids = prefix_token_ids + unique_part_token_ids
-        prompt = tokenizer.decode(prompt_token_ids)
+        prompt = cast(str, tokenizer.decode(prompt_token_ids))
         prompt_len = len(prompt_token_ids)
         assert min_len <= prompt_len <= max_len, (
             f"prompt_len {prompt_len} out of range {min_len}:{max_len}"
@@ -499,7 +546,7 @@ def repeat_and_sort_requests(
 ) -> list[str]:
     repeated_requests = requests * repeat_count
     if sort:
-        repeated_requests.sort(key=lambda x: x[1])
+        repeated_requests.sort(key=lambda request: request.prompt_len)
     else:
         random.shuffle(repeated_requests)
     return [req.prompt for req in repeated_requests]
@@ -522,7 +569,9 @@ def main(args):
     shared_prompts: list[str] | None = None
     expected_avg_prompt_tokens: float | None = None
     if args.use_fixed_prompt:
-        shared_prompts, expected_avg_prompt_tokens = prepare_fixed_prompts(args)
+        shared_prompts, expected_avg_prompt_tokens = prepare_fixed_prompts(
+            args, args.model
+        )
     elif args.compare_model is None or not args.fair_compare:
         shared_prompts, expected_avg_prompt_tokens = prepare_prompts(args)
 
@@ -619,8 +668,9 @@ def create_argument_parser():
         "--use-fixed-prompt",
         action="store_true",
         help=(
-            "Use the built-in PROMPT string for all requests so each model "
-            "tokenizes the same raw text independently."
+            "Use the built-in PROMPT string as the base text and sample each "
+            "request length from --input-length-range by repeating or "
+            "truncating that prompt."
         ),
     )
     parser.add_argument(
