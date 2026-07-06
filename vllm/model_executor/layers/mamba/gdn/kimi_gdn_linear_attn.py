@@ -417,6 +417,23 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
         else:
             assert non_spec_query_start_loc is not None
+
+            # ── GDN stats capture (decode path) ─────────────────────────────
+            from vllm.model_executor.layers.mamba.gdn import (
+                gdn_stats_collector as _gsc,
+            )
+            _stats_collector = _gsc.get_collector()
+            _do_capture = _stats_collector.is_enabled
+            if _do_capture:
+                _num_dec = attn_metadata_narrowed.num_decodes
+                # beta: [1, num_decodes, num_heads] → [num_decodes, num_heads]
+                _stats_collector.record_beta(
+                    self.prefix, beta.squeeze(0)[:_num_dec]
+                )
+                _dec_indices = non_spec_state_indices_tensor[:_num_dec]
+                _state_before = recurrent_state[_dec_indices].clone().float()
+            # ────────────────────────────────────────────────────────────────
+
             g1 = fused_kda_gate(
                 rearrange(g1, "1 n h d -> n (h d)"),
                 self.A_log,
@@ -439,6 +456,18 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 ssm_state_indices=non_spec_state_indices_tensor,
             )
+
+            # ── GDN stats capture (state delta) ─────────────────────────────
+            if _do_capture:
+                # last_recurrent_state: [num_decodes, num_heads, dv, dk]
+                _state_after = last_recurrent_state.float()
+                _delta = (
+                    (_state_after - _state_before)
+                    .flatten(1)
+                    .norm(dim=-1)  # [num_decodes]
+                )
+                _stats_collector.record_state_delta(self.prefix, _delta)
+            # ────────────────────────────────────────────────────────────────
         core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
             0, :num_actual_tokens
         ]

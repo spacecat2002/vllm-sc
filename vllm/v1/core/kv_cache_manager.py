@@ -138,7 +138,7 @@ class KVCacheManager:
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
-
+        # KVCacheManager会把所有操作都委托给coordinator
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,

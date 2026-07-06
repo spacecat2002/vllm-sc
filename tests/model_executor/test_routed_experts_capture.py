@@ -86,6 +86,30 @@ def test_base_router_capture_pre_eplb_mapping():
     assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
 
 
+def test_base_router_trace_captures_inputs_and_pre_eplb_routing():
+    router = _make_router()
+    captured = []
+
+    def trace_fn(hidden_states, topk_weights, topk_ids):
+        captured.append(
+            (hidden_states.clone(), topk_weights.clone(), topk_ids.clone())
+        )
+
+    router.set_trace_fn(trace_fn)
+    hidden_states = torch.tensor([[1.0, 2.0]])
+    _, topk_ids = router.select_experts(
+        hidden_states=hidden_states,
+        router_logits=torch.empty(1),
+    )
+
+    assert len(captured) == 1
+    traced_hidden_states, traced_weights, traced_ids = captured[0]
+    assert torch.equal(traced_hidden_states, hidden_states)
+    assert torch.equal(traced_weights, torch.ones((2, 2)))
+    assert torch.equal(traced_ids, torch.tensor([[1, 2], [3, 4]]))
+    assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
+
+
 def test_base_router_capture_with_eplb_enabled():
     eplb_state = EplbLayerState()
     eplb_state.expert_load_view = torch.zeros(32, dtype=torch.int64)

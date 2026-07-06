@@ -10,7 +10,7 @@ This module provides helpers for running standard attention backends
 
 import logging
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -130,8 +130,8 @@ def _create_vllm_config(
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
     model_config = ModelConfig(
-        model="meta-llama/Meta-Llama-3-8B",
-        tokenizer="meta-llama/Meta-Llama-3-8B",
+        model="Qwen/Qwen3-8B",
+        tokenizer="Qwen/Qwen3-8B",
         trust_remote_code=False,
         dtype="auto",  # Use model's native dtype
         seed=0,
@@ -442,12 +442,18 @@ def _run_single_benchmark(
 
     # Benchmark
     times = []
+    decode_nvtx = (
+        torch.cuda.nvtx.range("decode_attention")
+        if torch.cuda.is_available()
+        else nullcontext()
+    )
     for _ in range(config.repeats):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
         start.record()
-        benchmark_fn()
+        with decode_nvtx:
+            benchmark_fn()
         end.record()
 
         torch.accelerator.synchronize()

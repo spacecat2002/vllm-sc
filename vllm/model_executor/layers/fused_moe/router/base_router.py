@@ -171,10 +171,24 @@ class BaseRouter(FusedMoERouter):
         self.eplb_state = eplb_state
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.trace_fn: (
+            Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None
+        ) = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
+
+    def set_trace_fn(
+        self,
+        trace_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None,
+    ) -> None:
+        """Set a research callback for router inputs and logical routing.
+
+        This is separate from :meth:`set_capture_fn` so that diagnostic
+        tracing can coexist with the request-level routed-experts feature.
+        """
+        self.trace_fn = trace_fn
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -288,6 +302,9 @@ class BaseRouter(FusedMoERouter):
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+
+        if self.trace_fn is not None:
+            self.trace_fn(hidden_states, topk_weights, topk_ids)
 
         # Step 4: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

@@ -459,6 +459,11 @@ def main():
         help="Prefill backends to compare (fa2, fa3, fa4). "
         "Uses the first decode backend for impl construction.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["decode_attention", "decode_vs_prefill"],
+        help="Special benchmark mode",
+    )
 
     # Batch specifications
     parser.add_argument(
@@ -477,8 +482,8 @@ def main():
 
     # Benchmark settings
     parser.add_argument("--device", default="cuda:0", help="Device")
-    parser.add_argument("--repeats", type=int, default=1, help="Repetitions")
-    parser.add_argument("--warmup-iters", type=int, default=3, help="Warmup iterations")
+    parser.add_argument("--repeats", type=int, default=10, help="Repetitions")
+    parser.add_argument("--warmup-iters", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--profile-memory", action="store_true", help="Profile memory")
     parser.add_argument(
         "--kv-cache-dtype",
@@ -546,7 +551,7 @@ def main():
         args.prefill_backends = yaml_config.get("prefill_backends", None)
 
         # Check for special modes
-        args.mode = yaml_config.get("mode", None)
+        args.mode = yaml_config.get("mode", args.mode)
 
         # Batch specs and sizes
         # Support both explicit batch_specs and generated batch_spec_ranges
@@ -656,6 +661,15 @@ def main():
     console.print(f"KV cache dtype: {args.kv_cache_dtype}")
     console.print(f"CUDA graphs: {args.cuda_graphs}")
     console.print()
+
+    if args.mode == "decode_attention":
+        console.print("[yellow]Mode: Decode attention profiling[/]")
+        console.print(
+            "[dim]NVTX ranges will label the decode attention compute call.[/]"
+        )
+        console.print(
+            "[dim]Use --no-cuda-graphs for the cleanest per-kernel traces.[/]"
+        )
 
     init_workspace_manager(args.device)
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import math
 import statistics
+from contextlib import contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -43,6 +44,15 @@ from vllm.v1.attention.ops.triton_turboquant_store import (
 )
 
 DEVICE = torch.device(current_platform.device_type)
+
+
+@contextmanager
+def nvtx_range(name: str):
+    if torch.cuda.is_available():
+        with torch.cuda.nvtx.range(name):
+            yield
+    else:
+        yield
 
 
 def _build_hadamard(d: int, device: torch.device) -> torch.Tensor:
@@ -192,100 +202,106 @@ def benchmark_store(
     warmup: int,
     repeats: int,
 ) -> dict[str, StageTiming]:
-    cfg = tensors["cfg"]
-    key = tensors["key"]
-    value = tensors["value"]
-    kv_cache = tensors["kv_cache"]
-    slot_mapping = tensors["slot_mapping"]
-    PiT = tensors["PiT"]
-    midpoints = tensors["midpoints"]
+    with nvtx_range("benchmark_store"):
+        cfg = tensors["cfg"]
+        key = tensors["key"]
+        value = tensors["value"]
+        kv_cache = tensors["kv_cache"]
+        slot_mapping = tensors["slot_mapping"]
+        PiT = tensors["PiT"]
+        midpoints = tensors["midpoints"]
 
-    N, H, D = key.shape
-    NH = N * H
-    block_size = kv_cache.shape[1]
-    BLOCK_D = triton.next_power_of_2(D)
-    mse_bytes = math.ceil(D * cfg.key_mse_bits / 8)
-    n_centroids = 2**cfg.key_mse_bits
-    val_data_bytes = math.ceil(D * cfg.effective_value_quant_bits / 8)
-    BLOCK_VAL = triton.next_power_of_2(val_data_bytes)
-    block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
-    stride_block = kv_cache.stride(0)
-    stride_pos = kv_cache.stride(1)
-    stride_head = kv_cache.stride(2)
-    grid = (NH,)
+        N, H, D = key.shape
+        NH = N * H
+        block_size = kv_cache.shape[1]
+        BLOCK_D = triton.next_power_of_2(D)
+        mse_bytes = math.ceil(D * cfg.key_mse_bits / 8)
+        n_centroids = 2**cfg.key_mse_bits
+        val_data_bytes = math.ceil(D * cfg.effective_value_quant_bits / 8)
+        BLOCK_VAL = triton.next_power_of_2(val_data_bytes)
+        block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
+        stride_block = kv_cache.stride(0)
+        stride_pos = kv_cache.stride(1)
+        stride_head = kv_cache.stride(2)
+        grid = (NH,)
 
-    if cfg.key_fp8:
-        k_flat = key.reshape(NH, D).contiguous()
-        v_flat = value.reshape(NH, D).contiguous()
-        fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
+        if cfg.key_fp8:
+            k_flat = key.reshape(NH, D).contiguous()
+            v_flat = value.reshape(NH, D).contiguous()
+            fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
-        def run_kernel():
-            _tq_fused_store_fp8[grid](
-                k_flat,
-                v_flat,
-                kv_cache.view(-1),
-                slot_mapping,
-                stride_cache_block=stride_block,
-                stride_cache_pos=stride_pos,
-                stride_cache_head=stride_head,
-                D=D,
-                H=H,
-                BLOCK_SIZE=block_size,
-                BLOCK_D=BLOCK_D,
-                KPS=cfg.key_packed_size,
-                VQB=cfg.effective_value_quant_bits,
-                VAL_DATA_BYTES=val_data_bytes,
-                BLOCK_VAL=BLOCK_VAL,
-                BLOCK_GRP=block_grp,
-                FP8_E4B15=fp8_e4b15,
-                num_warps=4,
-                num_stages=1,
+            def run_kernel():
+                with nvtx_range("store_kernel"):
+                    _tq_fused_store_fp8[grid](
+                        k_flat,
+                        v_flat,
+                        kv_cache.view(-1),
+                        slot_mapping,
+                        stride_cache_block=stride_block,
+                        stride_cache_pos=stride_pos,
+                        stride_cache_head=stride_head,
+                        D=D,
+                        H=H,
+                        BLOCK_SIZE=block_size,
+                        BLOCK_D=BLOCK_D,
+                        KPS=cfg.key_packed_size,
+                        VQB=cfg.effective_value_quant_bits,
+                        VAL_DATA_BYTES=val_data_bytes,
+                        BLOCK_VAL=BLOCK_VAL,
+                        BLOCK_GRP=block_grp,
+                        FP8_E4B15=fp8_e4b15,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+
+            return timed_stages(
+                {"store_kernel": run_kernel}, warmup=warmup, repeats=repeats
             )
 
-        return timed_stages({"store_kernel": run_kernel}, warmup=warmup, repeats=repeats)
+        k_flat_buf = key.float().reshape(NH, D)
+        v_flat_buf = value.float().reshape(NH, D)
+        y_buf = torch.empty(NH, D, device=DEVICE, dtype=torch.float32)
+        norms_buf = torch.empty(NH, 1, device=DEVICE, dtype=torch.float32)
 
-    k_flat_buf = key.float().reshape(NH, D)
-    v_flat_buf = value.float().reshape(NH, D)
-    y_buf = torch.empty(NH, D, device=DEVICE, dtype=torch.float32)
-    norms_buf = torch.empty(NH, 1, device=DEVICE, dtype=torch.float32)
+        def preprocess():
+            with nvtx_range("store_preprocess"):
+                norms = k_flat_buf.norm(dim=1, keepdim=True)
+                norms_buf.copy_(norms)
+                y_buf.copy_(k_flat_buf / (norms + 1e-8) @ PiT)
 
-    def preprocess():
-        norms = k_flat_buf.norm(dim=1, keepdim=True)
-        norms_buf.copy_(norms)
-        y_buf.copy_(k_flat_buf / (norms + 1e-8) @ PiT)
+        def run_kernel():
+            with nvtx_range("store_kernel"):
+                _tq_fused_store_mse[grid](
+                    y_buf,
+                    norms_buf.squeeze(1),
+                    v_flat_buf,
+                    midpoints,
+                    kv_cache.view(-1),
+                    slot_mapping,
+                    stride_cache_block=stride_block,
+                    stride_cache_pos=stride_pos,
+                    stride_cache_head=stride_head,
+                    D=D,
+                    H=H,
+                    BLOCK_SIZE=block_size,
+                    BLOCK_D=BLOCK_D,
+                    MSE_BYTES=mse_bytes,
+                    KPS=cfg.key_packed_size,
+                    VQB=cfg.effective_value_quant_bits,
+                    VAL_DATA_BYTES=val_data_bytes,
+                    BLOCK_VAL=BLOCK_VAL,
+                    MSE_BITS=cfg.key_mse_bits,
+                    N_CENTROIDS=n_centroids,
+                    BLOCK_GRP=block_grp,
+                    num_warps=4,
+                    num_stages=1,
+                )
 
-    def run_kernel():
-        _tq_fused_store_mse[grid](
-            y_buf,
-            norms_buf.squeeze(1),
-            v_flat_buf,
-            midpoints,
-            kv_cache.view(-1),
-            slot_mapping,
-            stride_cache_block=stride_block,
-            stride_cache_pos=stride_pos,
-            stride_cache_head=stride_head,
-            D=D,
-            H=H,
-            BLOCK_SIZE=block_size,
-            BLOCK_D=BLOCK_D,
-            MSE_BYTES=mse_bytes,
-            KPS=cfg.key_packed_size,
-            VQB=cfg.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            BLOCK_VAL=BLOCK_VAL,
-            MSE_BITS=cfg.key_mse_bits,
-            N_CENTROIDS=n_centroids,
-            BLOCK_GRP=block_grp,
-            num_warps=4,
-            num_stages=1,
+        return timed_stages(
+            {"store_preprocess": preprocess, "store_kernel": run_kernel},
+            warmup=warmup,
+            repeats=repeats,
         )
-
-    return timed_stages(
-        {"store_preprocess": preprocess, "store_kernel": run_kernel},
-        warmup=warmup,
-        repeats=repeats,
-    )
 
 
 def benchmark_decode(
@@ -295,110 +311,114 @@ def benchmark_decode(
     repeats: int,
     max_num_kv_splits: int,
 ) -> dict[str, StageTiming]:
-    cfg = tensors["cfg"]
-    D = tensors["D"]
-    Hk = tensors["Hk"]
-    Hq = tensors["Hq"]
-    query = tensors["query"]
-    kv_cache = tensors["kv_cache"]
-    block_table = tensors["block_table"]
-    seq_lens = tensors["seq_lens"]
-    Pi = tensors["Pi"]
-    PiT = tensors["PiT"]
-    centroids = tensors["centroids"]
-    block_size = tensors["block_size"]
+    with nvtx_range("benchmark_decode"):
+        cfg = tensors["cfg"]
+        D = tensors["D"]
+        Hk = tensors["Hk"]
+        Hq = tensors["Hq"]
+        query = tensors["query"]
+        kv_cache = tensors["kv_cache"]
+        block_table = tensors["block_table"]
+        seq_lens = tensors["seq_lens"]
+        Pi = tensors["Pi"]
+        PiT = tensors["PiT"]
+        centroids = tensors["centroids"]
+        block_size = tensors["block_size"]
 
-    B = query.shape[0]
-    scale = 1.0 / math.sqrt(D)
-    layout = _get_layout(
-        D, cfg.key_mse_bits, cfg.effective_value_quant_bits, cfg.key_packed_size
-    )
-    NUM_KV_SPLITS = max_num_kv_splits
-    kv_group_size = Hq // Hk
-    fp8_e4b15 = _use_fp8_e4b15(query.device.index or 0)
-    BLOCK_KV = 4
-    grid = (B, Hq, NUM_KV_SPLITS)
-    grid2 = (B, Hq)
-
-    mid_o = torch.empty(
-        B, Hq, NUM_KV_SPLITS, D + 1, dtype=torch.float32, device=DEVICE
-    )
-    output = torch.empty(B, Hq, D, dtype=query.dtype, device=DEVICE)
-    lse = torch.empty(B, Hq, dtype=torch.float32, device=DEVICE)
-
-    if cfg.key_fp8:
-        q_rot = query.contiguous()
-        stages: dict[str, Callable[[], None]] = {}
-    else:
-        q_float = query.float()
-        q_rot_buf = torch.empty(B, Hq, D, dtype=torch.float32, device=DEVICE)
-
-        def q_rotate():
-            q_rot_buf.copy_(q_float @ PiT)
-
-        q_rot = q_rot_buf
-        stages = {"decode_q_rotate": q_rotate}
-
-    def stage1():
-        _tq_decode_stage1[grid](
-            q_rot,
-            kv_cache,
-            block_table,
-            seq_lens,
-            centroids,
-            mid_o,
-            q_rot.stride(0),
-            q_rot.stride(1),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            mid_o.stride(0),
-            mid_o.stride(1),
-            mid_o.stride(2),
-            NUM_KV_HEADS=Hk,
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_SPLITS=NUM_KV_SPLITS,
-            KV_GROUP_SIZE=kv_group_size,
-            MSE_BITS=cfg.key_mse_bits,
-            MSE_BYTES=layout["mse_bytes"],
-            KPS=cfg.key_packed_size,
-            VQB=cfg.effective_value_quant_bits,
-            VAL_DATA_BYTES=layout["val_data_bytes"],
-            ATTN_SCALE=scale,
-            BLOCK_D=layout["BLOCK_D"],
-            BLOCK_KV=BLOCK_KV,
-            KEY_FP8=1 if cfg.key_fp8 else 0,
-            NORM_CORRECTION=1 if cfg.norm_correction else 0,
-            FP8_E4B15=fp8_e4b15,
-            num_warps=1,
-            num_stages=1,
+        B = query.shape[0]
+        scale = 1.0 / math.sqrt(D)
+        layout = _get_layout(
+            D, cfg.key_mse_bits, cfg.effective_value_quant_bits, cfg.key_packed_size
         )
+        NUM_KV_SPLITS = max_num_kv_splits
+        kv_group_size = Hq // Hk
+        fp8_e4b15 = _use_fp8_e4b15(query.device.index or 0)
+        BLOCK_KV = 4
+        grid = (B, Hq, NUM_KV_SPLITS)
+        grid2 = (B, Hq)
 
-    def stage2():
-        _fwd_kernel_stage2[grid2](
-            mid_o,
-            output,
-            lse,
-            seq_lens,
-            mid_o.stride(0),
-            mid_o.stride(1),
-            mid_o.stride(2),
-            output.stride(0),
-            output.stride(1),
-            lse.stride(0),
-            NUM_KV_SPLITS=NUM_KV_SPLITS,
-            BLOCK_DV=layout["BLOCK_D"],
-            Lv=D,
-            OUTPUT_FP16=1 if query.dtype == torch.float16 else 0,
-            num_warps=4,
-            num_stages=2,
+        mid_o = torch.empty(
+            B, Hq, NUM_KV_SPLITS, D + 1, dtype=torch.float32, device=DEVICE
         )
+        output = torch.empty(B, Hq, D, dtype=query.dtype, device=DEVICE)
+        lse = torch.empty(B, Hq, dtype=torch.float32, device=DEVICE)
 
-    stages["decode_stage1"] = stage1
-    stages["decode_stage2"] = stage2
-    return timed_stages(stages, warmup=warmup, repeats=repeats)
+        if cfg.key_fp8:
+            q_rot = query.contiguous()
+            stages: dict[str, Callable[[], None]] = {}
+        else:
+            q_float = query.float()
+            q_rot_buf = torch.empty(B, Hq, D, dtype=torch.float32, device=DEVICE)
+
+            def q_rotate():
+                with nvtx_range("decode_q_rotate"):
+                    q_rot_buf.copy_(q_float @ PiT)
+
+            q_rot = q_rot_buf
+            stages = {"decode_q_rotate": q_rotate}
+
+        def stage1():
+            with nvtx_range("decode_stage1"):
+                _tq_decode_stage1[grid](
+                    q_rot,
+                    kv_cache,
+                    block_table,
+                    seq_lens,
+                    centroids,
+                    mid_o,
+                    q_rot.stride(0),
+                    q_rot.stride(1),
+                    kv_cache.stride(0),
+                    kv_cache.stride(1),
+                    kv_cache.stride(2),
+                    block_table.stride(0),
+                    mid_o.stride(0),
+                    mid_o.stride(1),
+                    mid_o.stride(2),
+                    NUM_KV_HEADS=Hk,
+                    HEAD_DIM=D,
+                    BLOCK_SIZE=block_size,
+                    NUM_KV_SPLITS=NUM_KV_SPLITS,
+                    KV_GROUP_SIZE=kv_group_size,
+                    MSE_BITS=cfg.key_mse_bits,
+                    MSE_BYTES=layout["mse_bytes"],
+                    KPS=cfg.key_packed_size,
+                    VQB=cfg.effective_value_quant_bits,
+                    VAL_DATA_BYTES=layout["val_data_bytes"],
+                    ATTN_SCALE=scale,
+                    BLOCK_D=layout["BLOCK_D"],
+                    BLOCK_KV=BLOCK_KV,
+                    KEY_FP8=1 if cfg.key_fp8 else 0,
+                    NORM_CORRECTION=1 if cfg.norm_correction else 0,
+                    FP8_E4B15=fp8_e4b15,
+                    num_warps=1,
+                    num_stages=1,
+                )
+
+        def stage2():
+            with nvtx_range("decode_stage2"):
+                _fwd_kernel_stage2[grid2](
+                    mid_o,
+                    output,
+                    lse,
+                    seq_lens,
+                    mid_o.stride(0),
+                    mid_o.stride(1),
+                    mid_o.stride(2),
+                    output.stride(0),
+                    output.stride(1),
+                    lse.stride(0),
+                    NUM_KV_SPLITS=NUM_KV_SPLITS,
+                    BLOCK_DV=layout["BLOCK_D"],
+                    Lv=D,
+                    OUTPUT_FP16=1 if query.dtype == torch.float16 else 0,
+                    num_warps=4,
+                    num_stages=2,
+                )
+
+        stages["decode_stage1"] = stage1
+        stages["decode_stage2"] = stage2
+        return timed_stages(stages, warmup=warmup, repeats=repeats)
 
 
 def benchmark_dequant_bulk(
@@ -408,67 +428,70 @@ def benchmark_dequant_bulk(
     warmup: int,
     repeats: int,
 ) -> dict[str, StageTiming]:
-    cfg = tensors["cfg"]
-    D = tensors["D"]
-    Hk = tensors["Hk"]
-    kv_cache = tensors["kv_cache"]
-    block_table = tensors["block_table"][:1]
-    centroids = tensors["centroids"]
-    Pi_half = tensors["Pi_half"]
-    block_size = tensors["block_size"]
+    with nvtx_range("benchmark_dequant_bulk"):
+        cfg = tensors["cfg"]
+        D = tensors["D"]
+        Hk = tensors["Hk"]
+        kv_cache = tensors["kv_cache"]
+        block_table = tensors["block_table"][:1]
+        centroids = tensors["centroids"]
+        Pi_half = tensors["Pi_half"]
+        block_size = tensors["block_size"]
 
-    mse_bytes = math.ceil(D * cfg.key_mse_bits / 8)
-    val_data_bytes = math.ceil(D * cfg.effective_value_quant_bits / 8)
-    BLOCK_D = triton.next_power_of_2(D)
-    alloc_len = math.ceil(cached_len / block_size) * block_size
+        mse_bytes = math.ceil(D * cfg.key_mse_bits / 8)
+        val_data_bytes = math.ceil(D * cfg.effective_value_quant_bits / 8)
+        BLOCK_D = triton.next_power_of_2(D)
+        alloc_len = math.ceil(cached_len / block_size) * block_size
 
-    k_buf = torch.empty(1, Hk, alloc_len, D, dtype=torch.float16, device=DEVICE)
-    v_buf = torch.empty(1, Hk, alloc_len, D, dtype=torch.float16, device=DEVICE)
-    grid = (alloc_len, Hk)
+        k_buf = torch.empty(1, Hk, alloc_len, D, dtype=torch.float16, device=DEVICE)
+        v_buf = torch.empty(1, Hk, alloc_len, D, dtype=torch.float16, device=DEVICE)
+        grid = (alloc_len, Hk)
 
-    def dequant():
-        _tq_full_dequant_kv[grid](
-            kv_cache,
-            block_table,
-            centroids,
-            k_buf,
-            v_buf,
-            k_buf.stride(0),
-            k_buf.stride(1),
-            k_buf.stride(2),
-            v_buf.stride(0),
-            v_buf.stride(1),
-            v_buf.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_HEADS=Hk,
-            MSE_BYTES=mse_bytes,
-            KPS=cfg.key_packed_size,
-            VQB=cfg.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            MSE_BITS=cfg.key_mse_bits,
-            KEY_FP8=1 if cfg.key_fp8 else 0,
-            BLOCK_D=BLOCK_D,
-            NORM_CORRECTION=1 if cfg.norm_correction else 0,
-            FP8_E4B15=_use_fp8_e4b15(0),
-            num_warps=4,
-        )
+        def dequant():
+            with nvtx_range("dequant_bulk"):
+                _tq_full_dequant_kv[grid](
+                    kv_cache,
+                    block_table,
+                    centroids,
+                    k_buf,
+                    v_buf,
+                    k_buf.stride(0),
+                    k_buf.stride(1),
+                    k_buf.stride(2),
+                    v_buf.stride(0),
+                    v_buf.stride(1),
+                    v_buf.stride(2),
+                    kv_cache.stride(0),
+                    kv_cache.stride(1),
+                    kv_cache.stride(2),
+                    block_table.stride(0),
+                    HEAD_DIM=D,
+                    BLOCK_SIZE=block_size,
+                    NUM_KV_HEADS=Hk,
+                    MSE_BYTES=mse_bytes,
+                    KPS=cfg.key_packed_size,
+                    VQB=cfg.effective_value_quant_bits,
+                    VAL_DATA_BYTES=val_data_bytes,
+                    MSE_BITS=cfg.key_mse_bits,
+                    KEY_FP8=1 if cfg.key_fp8 else 0,
+                    BLOCK_D=BLOCK_D,
+                    NORM_CORRECTION=1 if cfg.norm_correction else 0,
+                    FP8_E4B15=_use_fp8_e4b15(0),
+                    num_warps=4,
+                )
 
-    stages: dict[str, Callable[[], None]] = {"dequant_bulk": dequant}
-    if not cfg.key_fp8:
-        k_flat_buf = torch.empty(Hk * cached_len, D, dtype=torch.float16, device=DEVICE)
+        stages: dict[str, Callable[[], None]] = {"dequant_bulk": dequant}
+        if not cfg.key_fp8:
+            k_flat_buf = torch.empty(Hk * cached_len, D, dtype=torch.float16, device=DEVICE)
 
-        def inverse_rotate():
-            k_flat = k_buf[0, :, :cached_len, :].reshape(-1, D)
-            k_flat_buf.copy_(k_flat @ Pi_half)
+            def inverse_rotate():
+                with nvtx_range("inverse_rotate"):
+                    k_flat = k_buf[0, :, :cached_len, :].reshape(-1, D)
+                    k_flat_buf.copy_(k_flat @ Pi_half)
 
-        stages["inverse_rotate"] = inverse_rotate
+            stages["inverse_rotate"] = inverse_rotate
 
-    return timed_stages(stages, warmup=warmup, repeats=repeats)
+        return timed_stages(stages, warmup=warmup, repeats=repeats)
 
 
 def benchmark_e2e(
@@ -478,45 +501,48 @@ def benchmark_e2e(
     repeats: int,
     max_num_kv_splits: int,
 ) -> dict[str, StageTiming]:
-    cfg = tensors["cfg"]
+    with nvtx_range("benchmark_e2e"):
+        cfg = tensors["cfg"]
 
-    def store():
-        triton_turboquant_store(
-            tensors["key"],
-            tensors["value"],
-            tensors["kv_cache"],
-            tensors["slot_mapping"],
-            tensors["PiT"],
-            tensors["midpoints"],
-            mse_bits=cfg.key_mse_bits,
-            key_packed_size=cfg.key_packed_size,
-            value_quant_bits=cfg.effective_value_quant_bits,
-            key_fp8=cfg.key_fp8,
+        def store():
+            with nvtx_range("e2e_store"):
+                triton_turboquant_store(
+                    tensors["key"],
+                    tensors["value"],
+                    tensors["kv_cache"],
+                    tensors["slot_mapping"],
+                    tensors["PiT"],
+                    tensors["midpoints"],
+                    mse_bits=cfg.key_mse_bits,
+                    key_packed_size=cfg.key_packed_size,
+                    value_quant_bits=cfg.effective_value_quant_bits,
+                    key_fp8=cfg.key_fp8,
+                )
+
+        def decode():
+            with nvtx_range("e2e_decode"):
+                triton_turboquant_decode_attention(
+                    query=tensors["query"],
+                    kv_cache=tensors["kv_cache"],
+                    block_table=tensors["block_table"],
+                    seq_lens=tensors["seq_lens"],
+                    Pi=tensors["Pi"],
+                    centroids=tensors["centroids"],
+                    scale=1.0 / math.sqrt(tensors["D"]),
+                    mse_bits=cfg.key_mse_bits,
+                    key_packed_size=cfg.key_packed_size,
+                    value_quant_bits=cfg.effective_value_quant_bits,
+                    key_fp8=cfg.key_fp8,
+                    norm_correction=cfg.norm_correction,
+                    PiT=tensors["PiT"],
+                    max_num_kv_splits=max_num_kv_splits,
+                )
+
+        return timed_stages(
+            {"e2e_store": store, "e2e_decode": decode},
+            warmup=warmup,
+            repeats=repeats,
         )
-
-    def decode():
-        triton_turboquant_decode_attention(
-            query=tensors["query"],
-            kv_cache=tensors["kv_cache"],
-            block_table=tensors["block_table"],
-            seq_lens=tensors["seq_lens"],
-            Pi=tensors["Pi"],
-            centroids=tensors["centroids"],
-            scale=1.0 / math.sqrt(tensors["D"]),
-            mse_bits=cfg.key_mse_bits,
-            key_packed_size=cfg.key_packed_size,
-            value_quant_bits=cfg.effective_value_quant_bits,
-            key_fp8=cfg.key_fp8,
-            norm_correction=cfg.norm_correction,
-            PiT=tensors["PiT"],
-            max_num_kv_splits=max_num_kv_splits,
-        )
-
-    return timed_stages(
-        {"e2e_store": store, "e2e_decode": decode},
-        warmup=warmup,
-        repeats=repeats,
-    )
 
 
 def main() -> None:
@@ -532,8 +558,8 @@ def main() -> None:
         ],
     )
     parser.add_argument("--head-dim", type=int, default=128)
-    parser.add_argument("--num-kv-heads", type=int, default=4)
-    parser.add_argument("--num-q-heads", type=int, default=4)
+    parser.add_argument("--num-kv-heads", type=int, default=8)
+    parser.add_argument("--num-q-heads", type=int, default=32)
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--block-size", type=int, default=16)
@@ -565,18 +591,19 @@ def main() -> None:
 
     # Pre-populate cache for decode/dequant benchmarks.
     cfg = tensors["cfg"]
-    triton_turboquant_store(
-        tensors["key"],
-        tensors["value"],
-        tensors["kv_cache"],
-        tensors["slot_mapping"],
-        tensors["PiT"],
-        tensors["midpoints"],
-        mse_bits=cfg.key_mse_bits,
-        key_packed_size=cfg.key_packed_size,
-        value_quant_bits=cfg.effective_value_quant_bits,
-        key_fp8=cfg.key_fp8,
-    )
+    with nvtx_range("prefill_cache"):
+        triton_turboquant_store(
+            tensors["key"],
+            tensors["value"],
+            tensors["kv_cache"],
+            tensors["slot_mapping"],
+            tensors["PiT"],
+            tensors["midpoints"],
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+        )
     torch.cuda.synchronize()
 
     header = (
@@ -590,37 +617,43 @@ def main() -> None:
     )
 
     if "store" in args.paths:
-        store_timings = benchmark_store(tensors, warmup=args.warmup, repeats=args.repeats)
+        with nvtx_range("main_store"):
+            store_timings = benchmark_store(
+                tensors, warmup=args.warmup, repeats=args.repeats
+            )
         _print_table("Store path", store_timings)
 
     if "decode" in args.paths:
-        decode_timings = benchmark_decode(
-            tensors,
-            warmup=args.warmup,
-            repeats=args.repeats,
-            max_num_kv_splits=args.max_kv_splits,
-        )
+        with nvtx_range("main_decode"):
+            decode_timings = benchmark_decode(
+                tensors,
+                warmup=args.warmup,
+                repeats=args.repeats,
+                max_num_kv_splits=args.max_kv_splits,
+            )
         _print_table("Decode path", decode_timings)
 
     if "dequant" in args.paths:
-        dequant_timings = benchmark_dequant_bulk(
-            tensors,
-            cached_len=args.cached_len,
-            warmup=args.warmup,
-            repeats=args.repeats,
-        )
+        with nvtx_range("main_dequant_bulk"):
+            dequant_timings = benchmark_dequant_bulk(
+                tensors,
+                cached_len=args.cached_len,
+                warmup=args.warmup,
+                repeats=args.repeats,
+            )
         _print_table(
             f"Continuation prefill dequant (cached_len={args.cached_len})",
             dequant_timings,
         )
 
     if "e2e" in args.paths:
-        e2e_timings = benchmark_e2e(
-            tensors,
-            warmup=args.warmup,
-            repeats=args.repeats,
-            max_num_kv_splits=args.max_kv_splits,
-        )
+        with nvtx_range("main_e2e"):
+            e2e_timings = benchmark_e2e(
+                tensors,
+                warmup=args.warmup,
+                repeats=args.repeats,
+                max_num_kv_splits=args.max_kv_splits,
+            )
         _print_table("End-to-end launcher (store + decode)", e2e_timings)
 
 

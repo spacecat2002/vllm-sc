@@ -1,0 +1,48 @@
+Explain why the sky appears blue during the day and red near sunset, using Rayleigh scattering but avoiding unnecessary equations.
+Compare nuclear fission and nuclear fusion in terms of physical mechanism, fuel, waste, safety, and present-day engineering feasibility.
+Describe how CRISPR-Cas9 edits DNA, then identify two scientific limitations and two ethical concerns associated with its use.
+Explain the difference between classical bits and quantum bits to a software engineer who has never studied quantum mechanics.
+Why does increasing atmospheric carbon dioxide warm Earth? Distinguish the greenhouse effect from ozone depletion.
+Design a controlled experiment to test whether a new fertilizer improves tomato yield while accounting for soil quality and weather.
+Prove that there are infinitely many prime numbers, and explain the key contradiction in plain language.
+Solve the recurrence T(n) = 2T(n/2) + n log n and state its asymptotic complexity with justification.
+A fair coin is tossed until two consecutive heads appear. Derive the expected number of tosses rather than only stating the answer.
+Explain why gradient descent can converge slowly in a narrow curved loss valley and how momentum changes the optimization dynamics.
+Given a matrix A, explain the geometric meaning of its eigenvectors and eigenvalues and provide a concrete two-dimensional example.
+Estimate how many piano tuners work in Shanghai using a Fermi calculation, clearly stating every assumption.
+Write a Python function that merges overlapping time intervals in O(n log n) time and include tests for nested and touching intervals.
+Implement an LRU cache in Python without using functools, and explain why both lookup and update are O(1).
+Review this concurrency design: multiple producers append work to a shared list while one consumer polls it without locks. Identify failure modes and propose a safe alternative.
+Explain the difference between TCP flow control and congestion control, including what problem each mechanism prevents.
+Design a database schema for a multi-tenant issue tracker with projects, users, comments, labels, and audit history; discuss the essential indexes.
+Show how to detect a cycle in a directed graph using depth-first search, and contrast it with Kahn's topological-sort approach.
+Diagnose a web service whose median latency is stable but P99 latency doubles under moderate load; propose a measurement plan before suggesting fixes.
+Explain when a Bloom filter is useful, derive the source of false positives, and describe how its parameters affect memory usage.
+Write a SQL query that returns each department's three highest-paid employees, correctly handling ties with a window function.
+Create a minimal PyTorch training loop with gradient accumulation, mixed precision, gradient clipping, and a learning-rate scheduler.
+Compare process parallelism, thread parallelism, and asynchronous I/O for a Python service that performs both network requests and CPU-heavy parsing.
+Find the bug conceptually: a distributed training job hangs only when one rank receives an empty batch, while all collective calls appear correct on normal batches.
+Summarize the main economic causes of inflation and explain why a single observed price increase is not by itself evidence of economy-wide inflation.
+Compare gross domestic product, gross national income, and median household income as measures of economic welfare, including their blind spots.
+Explain how compound interest works and calculate the future value of a monthly investment of 500 dollars for ten years at a hypothetical annual return of six percent.
+Analyze the trade-offs between fixed-rate and adjustable-rate mortgages without giving personalized financial advice.
+Describe how central-bank interest-rate changes can affect borrowing, exchange rates, asset prices, employment, and inflation through different transmission channels.
+Construct a simple supply-and-demand example in which a price ceiling creates a shortage, then discuss why real markets may behave less cleanly.
+Summarize the causes of the French Revolution while distinguishing structural pressures, immediate fiscal crises, and triggering political events.
+Compare the Roman Republic's political institutions with those of a modern representative democracy, avoiding simplistic one-to-one analogies.
+Explain why the printing press changed European society, considering religion, science, literacy, state power, and the economics of information.
+Analyze two competing interpretations of the Industrial Revolution: one emphasizing productivity gains and one emphasizing worker living conditions.
+Describe the historical context of the Silk Road and explain why it should be understood as a network rather than a single route.
+Write a concise museum label for an ancient ceramic vessel that separates directly observable features from uncertain interpretation.
+Draft a professional email declining a meeting because the agenda is unclear, while remaining constructive and proposing an asynchronous alternative.
+Rewrite the sentence "The system failed because the team was careless" in a neutral incident-report style that focuses on mechanisms rather than blame.
+Create a short science-fiction scene in which a linguist realizes that an alien language encodes probability rather than tense.
+Write a four-line poem about memory using concrete imagery, without using the words memory, remember, past, or time.
+Turn a vague request to "make the dashboard better" into a precise product specification with measurable acceptance criteria.
+Summarize a hypothetical 2,000-word technical report for three audiences: an executive, an engineer, and a regulator, explaining how the emphasis should differ.
+请用通俗但准确的语言解释混合专家模型中的路由、Top-k expert 选择、负载不均衡和 All-to-All 通信之间的关系。
+比较前缀缓存、投机解码和连续批处理三种大模型推理优化技术，说明它们分别改善什么瓶颈以及可能引入的代价。
+设计一个实验，判断相邻 MoE 层的路由分布是否具有可预测性，并明确训练集划分、评价指标、基线和消融实验。
+解释为什么只优化各个 GPU 的平均 token 数量可能无法降低 MoE 推理的 P99 延迟，并给出一个更合理的联合代价函数。
+将“这个方案应该会更快”改写成一段可验证的工程假设，包含目标指标、对照组、硬件条件和失败判据。
+阅读一个模型系统论文时，如何区分算法收益、实现优化和硬件特化带来的性能提升？请给出一套审查步骤。

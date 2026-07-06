@@ -1134,6 +1134,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
 
+            moe_trace_collector = getattr(self, "moe_trace_collector", None)
+            if moe_trace_collector is not None:
+                moe_trace_collector.begin_forward(
+                    input_batch.num_scheduled_tokens.tolist(),
+                    input_batch.num_computed_tokens_np.tolist(),
+                    input_batch.prefill_len_np.tolist(),
+                )
+
             if self.lora_config:
                 # Activate LoRA adapters.
                 lora_inputs = self.lora_state.make_lora_inputs(

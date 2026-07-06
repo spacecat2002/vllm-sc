@@ -730,6 +730,19 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        # Attach only after profiling, compilation, and kernel warmup so the
+        # research trace contains real inference rather than dummy inputs.
+        from vllm.model_executor.layers.fused_moe.moe_trace import (
+            maybe_attach_moe_trace,
+        )
+
+        self.model_runner.moe_trace_collector = maybe_attach_moe_trace(
+            enforce_eager=self.model_config.enforce_eager,
+            static_forward_context=(
+                self.vllm_config.compilation_config.static_forward_context
+            ),
+        )
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)

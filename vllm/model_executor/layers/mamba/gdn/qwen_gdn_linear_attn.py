@@ -1461,10 +1461,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
+            from vllm.model_executor.layers.mamba.gdn import (
+                gdn_stats_collector as _gsc,
+            )
+            _stats_collector = _gsc.get_collector()
+            _stats_collector.note_prefill_forward()
+            _do_capture = _stats_collector.is_enabled
+
             assert non_spec_state_indices_tensor is not None
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()  # type: ignore[index]
             assert has_initial_state is not None
             initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
+            if _do_capture:
+                assert beta_non_spec is not None
+                _stats_collector.record_beta(
+                    self.prefix, beta_non_spec.float().mean().reshape(1)
+                )
+                _state_before = initial_state.float()
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1485,7 +1498,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            if _do_capture:
+                _after_flat = last_recurrent_state.float().flatten(1)
+                _before_flat = _state_before.flatten(1)
+                _delta = (_after_flat - _before_flat).norm(dim=-1)
+                _stats_collector.record_state_delta(self.prefix, _delta)
+                _stats_collector.record_state_cosine(
+                    self.prefix,
+                    torch.nn.functional.cosine_similarity(
+                        _before_flat, _after_flat, dim=-1
+                    ),
+                )
         elif attn_metadata.num_decodes > 0:
+            # ── GDN stats capture (decode path) ─────────────────────────────
+            from vllm.model_executor.layers.mamba.gdn import (
+                gdn_stats_collector as _gsc,
+            )
+            _stats_collector = _gsc.get_collector()
+            _stats_collector.note_decode_forward()
+            _do_capture = _stats_collector.is_enabled
+            if _do_capture:
+                _num_dec = attn_metadata.num_decodes
+                _dec_indices = non_spec_state_indices_tensor[:_num_dec]  # type: ignore[index]
+                # b is raw (before sigmoid); shape [num_decodes, num_v_heads]
+                _beta_vals = b[:_num_dec].float().sigmoid()
+                _stats_collector.record_beta(self.prefix, _beta_vals)
+                _state_before = ssm_state[_dec_indices].clone().float()  # type: ignore[index]
+            # ────────────────────────────────────────────────────────────────
+
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1505,6 +1545,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     use_qk_l2norm_in_kernel=True,
                 )
             )
+
+            # ── GDN stats capture (state delta) ─────────────────────────────
+            if _do_capture:
+                # ssm_state was updated in-place; compare with saved snapshot
+                _state_after = ssm_state[_dec_indices].float()  # type: ignore[index]
+                _after_flat = _state_after.flatten(1)
+                _before_flat = _state_before.flatten(1)
+                _delta = (_after_flat - _before_flat).norm(dim=-1)
+                _stats_collector.record_state_delta(self.prefix, _delta)
+                _stats_collector.record_state_cosine(
+                    self.prefix,
+                    torch.nn.functional.cosine_similarity(
+                        _before_flat, _after_flat, dim=-1
+                    ),
+                )
+            # ────────────────────────────────────────────────────────────────
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -1542,6 +1598,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             else self_kv_cache[0].transpose(-1, -2)
         )
         ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        from vllm.model_executor.layers.mamba.gdn import (
+            gdn_stats_collector as _gsc,
+        )
+        _stats_collector = _gsc.get_collector()
+        _stats_collector.note_decode_forward()
+        _do_capture = _stats_collector.is_enabled
+        if _do_capture:
+            _state_indices = non_spec_state_indices_tensor[:num_actual_tokens]
+            _state_before = ssm_state[_state_indices].clone().float()
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -1551,7 +1618,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkv_non_spec, b, a = (
             gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
                 qkvz,
-                attn_metadata.num_actual_tokens,
+                num_actual_tokens,
                 self.num_k_heads // self.tp_size,
                 self.num_v_heads // self.tp_size,
                 self.head_k_dim,
@@ -1569,6 +1636,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 validate_data=True,
             )
         )
+        if _do_capture:
+            _stats_collector.record_beta(self.prefix, b.float().sigmoid())
 
         # 2. Recurrent attention
         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(
@@ -1588,6 +1657,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             use_qk_l2norm_in_kernel=True,
             core_attn_out=core_attn_out.reshape(-1),
         )
+        if _do_capture:
+            _state_after = ssm_state[_state_indices].float()
+            _after_flat = _state_after.flatten(1)
+            _before_flat = _state_before.flatten(1)
+            _delta = (_after_flat - _before_flat).norm(dim=-1)
+            _stats_collector.record_state_delta(self.prefix, _delta)
+            _stats_collector.record_state_cosine(
+                self.prefix,
+                torch.nn.functional.cosine_similarity(
+                    _before_flat, _after_flat, dim=-1
+                ),
+            )
 
     def _forward_core_decode_non_spec(
         self,
@@ -1611,10 +1692,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        from vllm.model_executor.layers.mamba.gdn import (
+            gdn_stats_collector as _gsc,
+        )
+        _stats_collector = _gsc.get_collector()
+        _stats_collector.note_decode_forward()
+        _do_capture = _stats_collector.is_enabled
+        if _do_capture:
+            _state_indices = non_spec_state_indices_tensor[:num_actual_tokens]
+            _state_before = ssm_state[_state_indices].clone().float()
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
+        if _do_capture:
+            _stats_collector.record_beta(self.prefix, b.float().sigmoid())
 
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -1641,6 +1733,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
+        if _do_capture:
+            _state_after = ssm_state[_state_indices].float()
+            _after_flat = _state_after.flatten(1)
+            _before_flat = _state_before.flatten(1)
+            _delta = (_after_flat - _before_flat).norm(dim=-1)
+            _stats_collector.record_state_delta(self.prefix, _delta)
+            _stats_collector.record_state_cosine(
+                self.prefix,
+                torch.nn.functional.cosine_similarity(
+                    _before_flat, _after_flat, dim=-1
+                ),
+            )
         return
 
 

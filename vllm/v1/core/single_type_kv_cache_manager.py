@@ -1010,7 +1010,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     #               * self.other_block_size
                     # so we insert dummy blocks at the beginning:
                     computed.extend([block_pool.null_block] * i)
-                    computed.append(cached)
+                    computed.append(cached) # 先补齐null，再把命中的block加上去
                 break  # we just need the last match - early stopping
 
         return computed_blocks
@@ -1069,10 +1069,14 @@ class MambaManager(SingleTypeKVCacheManager):
             # To put it in the next step, we return num_gpu_blocks + 1 so
             # that kv_cache_manager will think there is no enough blocks to allocate now
             # and don't schedule it in the current step.
+            # Mamba 限制不能依赖同一个 step 里别的请求刚产出的 block，
+            # 因为这些块对应的状态还没稳定，立刻复用会有时序风险。
             return self.block_pool.num_gpu_blocks + 1
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
+            # 非 align 模式下，Mamba 更像普通 block 管理，只是额外考虑 speculative tokens。
+            # 所以它不需要自己重写整套分配逻辑，复用父类更稳。
             if self.num_speculative_blocks > 0:
                 num_tokens += (
                     self.kv_cache_spec.block_size * self.num_speculative_blocks
@@ -1100,8 +1104,8 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             num_new_blocks = (
                 num_required_blocks
-                - len(new_computed_blocks)
-                - len(self.req_to_blocks[request_id])
+                - len(new_computed_blocks)  # scheduler刚命中的块不需要分配
+                - len(self.req_to_blocks[request_id])  # 已经分配的块也不需要分配
             )
             if num_new_blocks > 0:
                 if request_id in self._allocated_block_reqs:
@@ -1113,6 +1117,8 @@ class MambaManager(SingleTypeKVCacheManager):
                     # speculative blocks.
                     num_new_blocks = 1 + self.num_speculative_blocks
 
+            # 这些块虽然是 prefix cache 命中的，但如果它们当前 ref_cnt == 0，说明它们在 free queue 里仍然会占资源。
+            # 一旦本请求触碰它们，它们会从 free queue 里被移出，所以调度时必须把这部分潜在占用也算进去。
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
@@ -1150,7 +1156,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     "num_required_blocks "
                     f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
                 )
-                prev_block_len = len(req_blocks)
+                prev_block_len = len(req_blocks)  # 分配前的block数量
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block
                 if blocks_allocated:
@@ -1164,6 +1170,10 @@ class MambaManager(SingleTypeKVCacheManager):
                     # saves the hit state.
                     self.last_state_block_idx[request_id] = prev_block_len - 1
 
+                # 总共需要 num_required_blocks 个块；
+                # 其中 num_speculative_blocks 个是 speculative 预留；
+                # 另外 1 个是当前 running state block；
+                # 剩下的前面那些块，就是可以用 null block 占位、或者说逻辑上已经跳过的块。
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
                 )
@@ -1181,6 +1191,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     for block_idx in range(
                         prev_block_len - self.num_speculative_blocks, prev_block_len
                     ):
+                    # 如果 block_idx < num_skipped_blocks，就把这个 block 从旧位置挪到尾部，再把旧位置置为 null
                         if block_idx < num_skipped_blocks:
                             req_blocks.append(req_blocks[block_idx])
                             req_blocks[block_idx] = self._null_block
