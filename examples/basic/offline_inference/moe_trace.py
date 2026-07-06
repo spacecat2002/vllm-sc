@@ -58,34 +58,27 @@ def _num_experts(hf_config: Any) -> int:
     raise ValueError("Could not determine the number of experts from model config")
 
 
-def collect(args: argparse.Namespace) -> None:
-    output_dir = args.output_dir.resolve()
-    activation_dir = output_dir / "activations"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    prompts = _read_prompts(args.prompts)
+def _collect_dp_rank(
+    args: argparse.Namespace,
+    indexed_prompts: list[tuple[int, str]],
+    global_dp_rank: int,
+    dp_master_port: int,
+    shard_dir: Path,
+) -> None:
+    """Run one offline SPMD rank and save its request-level route shard."""
+    os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(global_dp_rank)
+    os.environ["VLLM_DP_SIZE"] = str(args.ep_size)
+    os.environ["VLLM_DP_MASTER_IP"] = "127.0.0.1"
+    os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
 
-    # Workers inherit these variables when LLM starts its executor processes.
-    os.environ["VLLM_MOE_TRACE_DIR"] = str(activation_dir)
-    # Generating N tokens performs one prefill forward and up to N - 1 decode
-    # forwards per prompt.
-    os.environ["VLLM_MOE_TRACE_MAX_STEPS"] = str(
-        len(prompts) * args.max_new_tokens
-    )
-    os.environ["VLLM_MOE_TRACE_MAX_TOKENS"] = str(args.max_tokens_per_sample)
-    os.environ["VLLM_MOE_TRACE_ACTIVATIONS"] = "input"
-    os.environ["VLLM_MOE_TRACE_ACTIVATION_DTYPE"] = args.activation_dtype
-    os.environ["VLLM_MOE_TRACE_TOKEN_SELECTION"] = "prefill_last"
-
-    # Import after setting the environment so spawned workers see the config.
     from vllm import LLM, SamplingParams
 
+    prompts = [prompt for _, prompt in indexed_prompts]
     llm = LLM(
         model=args.model,
-        # Pure EP topology for load-distribution experiments: attention is
-        # replicated over DP ranks, while experts are sharded over
-        # EP_SIZE = TP_SIZE * DP_SIZE = args.ep_size ranks.
+        # VLLM_DP_SIZE supplies DP=N, so EP_SIZE = TP_SIZE * DP_SIZE = N.
         tensor_parallel_size=1,
-        data_parallel_size=args.ep_size,
         enable_expert_parallel=True,
         max_model_len=args.max_model_len,
         max_num_seqs=len(prompts),
@@ -101,22 +94,149 @@ def collect(args: argparse.Namespace) -> None:
 
     request_outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
     routes: dict[str, np.ndarray] = {}
-    prompt_token_counts: list[int] = []
-    for sample_id, request_output in enumerate(request_outputs):
+    prompt_token_counts: dict[str, int] = {}
+    for (sample_id, _), request_output in zip(indexed_prompts, request_outputs):
         routed_experts = request_output.outputs[0].routed_experts
         if routed_experts is None:
             raise RuntimeError("vLLM did not return routed experts")
-        routes[f"sample_{sample_id:06d}"] = routed_experts
-        prompt_token_counts.append(len(request_output.prompt_token_ids))
+        sample_key = f"sample_{sample_id:06d}"
+        routes[sample_key] = routed_experts
+        prompt_token_counts[sample_key] = len(request_output.prompt_token_ids)
 
-    np.savez_compressed(output_dir / "routes.npz", **routes)
-    hf_config = llm.model_config.hf_text_config
+    np.savez_compressed(shard_dir / f"rank_{global_dp_rank:05d}.npz", **routes)
+    shard_metadata = {
+        "num_experts": _num_experts(llm.model_config.hf_text_config),
+        "prompt_token_counts": prompt_token_counts,
+    }
+    (shard_dir / f"rank_{global_dp_rank:05d}.json").write_text(
+        json.dumps(shard_metadata), encoding="utf-8"
+    )
+
+    # Match the offline DP example: let engine loops settle before process exit.
+    from time import sleep
+
+    sleep(1)
+
+
+def _merge_route_shards(
+    output_dir: Path,
+    shard_dir: Path,
+    num_samples: int,
+) -> tuple[int, list[int], list[int]]:
+    routes: dict[str, np.ndarray] = {}
+    prompt_token_counts: dict[str, int] = {}
+    sample_dp_ranks: dict[str, int] = {}
+    num_experts: int | None = None
+    for route_path in sorted(shard_dir.glob("rank_*.npz")):
+        with np.load(route_path) as shard:
+            routes.update({key: shard[key].copy() for key in shard.files})
+            rank_id = int(route_path.stem.removeprefix("rank_"))
+            sample_dp_ranks.update({key: rank_id for key in shard.files})
+        shard_metadata = json.loads(route_path.with_suffix(".json").read_text())
+        shard_num_experts = int(shard_metadata["num_experts"])
+        if num_experts is not None and shard_num_experts != num_experts:
+            raise ValueError("DP ranks reported different numbers of experts")
+        num_experts = shard_num_experts
+        prompt_token_counts.update(shard_metadata["prompt_token_counts"])
+
+    expected_keys = [f"sample_{sample_id:06d}" for sample_id in range(num_samples)]
+    if sorted(routes) != expected_keys:
+        raise RuntimeError(
+            f"Route shards are incomplete: expected {len(expected_keys)} samples, "
+            f"found {len(routes)}"
+        )
+    assert num_experts is not None
+    np.savez_compressed(
+        output_dir / "routes.npz",
+        **{key: routes[key] for key in expected_keys},
+    )
+    counts = [int(prompt_token_counts[key]) for key in expected_keys]
+    ranks = [sample_dp_ranks[key] for key in expected_keys]
+    return num_experts, counts, ranks
+
+
+def collect(args: argparse.Namespace) -> None:
+    output_dir = args.output_dir.resolve()
+    activation_dir = output_dir / "activations"
+    if (output_dir / "routes.npz").exists() or any(
+        activation_dir.glob("rank_*")
+    ):
+        raise FileExistsError(
+            f"Trace output already exists under {output_dir}; choose a new directory"
+        )
+
+    from uuid import uuid4
+
+    shard_dir = output_dir / "route_shards" / uuid4().hex
+    activation_dir.mkdir(parents=True, exist_ok=True)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    prompts = _read_prompts(args.prompts)
+    if args.ep_size > len(prompts):
+        raise ValueError("--ep-size cannot exceed the number of prompts")
+
+    # Child ranks inherit trace configuration from this parent process.
+    os.environ["VLLM_MOE_TRACE_DIR"] = str(activation_dir)
+    os.environ["VLLM_MOE_TRACE_MAX_STEPS"] = str(
+        len(prompts) * args.max_new_tokens
+    )
+    os.environ["VLLM_MOE_TRACE_MAX_TOKENS"] = str(args.max_tokens_per_sample)
+    os.environ["VLLM_MOE_TRACE_ACTIVATIONS"] = "input"
+    os.environ["VLLM_MOE_TRACE_ACTIVATION_DTYPE"] = args.activation_dtype
+    os.environ["VLLM_MOE_TRACE_TOKEN_SELECTION"] = "prefill_last"
+
+    from multiprocessing import Process
+
+    from vllm.platforms import current_platform
+    from vllm.utils.network_utils import get_open_port
+
+    if current_platform.is_rocm():
+        from multiprocessing import set_start_method
+
+        set_start_method("spawn", force=True)
+
+    dp_master_port = get_open_port()
+    indexed_prompts = list(enumerate(prompts))
+    floor = len(indexed_prompts) // args.ep_size
+    remainder = len(indexed_prompts) % args.ep_size
+
+    def shard_start(rank: int) -> int:
+        return rank * floor + min(rank, remainder)
+
+    processes: list[Process] = []
+    for global_dp_rank in range(args.ep_size):
+        rank_prompts = indexed_prompts[
+            shard_start(global_dp_rank) : shard_start(global_dp_rank + 1)
+        ]
+        process = Process(
+            target=_collect_dp_rank,
+            args=(args, rank_prompts, global_dp_rank, dp_master_port, shard_dir),
+        )
+        process.start()
+        processes.append(process)
+
+    for process in processes:
+        process.join(timeout=args.timeout)
+        if process.exitcode is None:
+            process.kill()
+            raise TimeoutError(f"DP process {process.pid} exceeded --timeout")
+        if process.exitcode != 0:
+            raise RuntimeError(
+                f"DP process {process.pid} exited with code {process.exitcode}"
+            )
+
+    num_experts, prompt_token_counts, sample_dp_ranks = _merge_route_shards(
+        output_dir,
+        shard_dir,
+        len(prompts),
+    )
+
     metadata = {
         "model": args.model,
         "expert_parallel_size": args.ep_size,
         "num_samples": len(prompts),
-        "num_experts": _num_experts(hf_config),
+        "num_experts": num_experts,
         "prompt_token_counts": prompt_token_counts,
+        "sample_dp_ranks": sample_dp_ranks,
         "route_shape": "[token, layer, top_k]",
         "activation_point": "input to each MoE router",
         "activation_token_selection": (
@@ -392,6 +512,12 @@ def parse_args() -> argparse.Namespace:
     collect_parser.add_argument("--max-model-len", type=int, default=4096)
     collect_parser.add_argument("--max-new-tokens", type=int, default=16)
     collect_parser.add_argument("--max-tokens-per-sample", type=int, default=4096)
+    collect_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=1800,
+        help="Maximum seconds to wait for each offline DP rank.",
+    )
     collect_parser.add_argument(
         "--activation-dtype",
         choices=("float16", "bfloat16", "float32"),
