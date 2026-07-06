@@ -101,4 +101,5 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             expert_map=layer.expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            profile_layer_name=getattr(layer, "layer_name", None),
         )

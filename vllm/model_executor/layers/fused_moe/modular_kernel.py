@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
@@ -20,6 +21,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.moe_profile import (
+    MoEProfileRecord,
+    make_record,
+    write_record,
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
@@ -1013,6 +1019,8 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
 
 @final
 class FusedMoEKernelModularImpl:
+    _next_profile_kernel_id = 0
+
     def __init__(
         self,
         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
@@ -1027,6 +1035,9 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.dp_size > 1
             and moe_parallel_config.use_ep
         )
+        self.profile_kernel_id = FusedMoEKernelModularImpl._next_profile_kernel_id
+        FusedMoEKernelModularImpl._next_profile_kernel_id += 1
+        self.profile_call_index = 0
 
     def _allocate_buffers(
         self,
@@ -1111,6 +1122,7 @@ class FusedMoEKernelModularImpl:
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
+        profile_record: MoEProfileRecord | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -1122,66 +1134,78 @@ class FusedMoEKernelModularImpl:
         The _prepare method is a wrapper around self.prepare_finalize.prepare
         that handles DBO and async.
         """
-        if not self.prepare_finalize.supports_async():
-            # We shouldn't be running an a2a kernel that doesn't
-            # support async prepare/finalize
-            # TODO(lucas): enable in follow-up
-            assert not dbo_enabled()
+        with (
+            profile_record.measure("dispatch_ms", hidden_states.device)
+            if profile_record is not None
+            else nullcontext()
+        ):
+            if not self.prepare_finalize.supports_async():
+                # We shouldn't be running an a2a kernel that doesn't
+                # support async prepare/finalize
+                # TODO(lucas): enable in follow-up
+                assert not dbo_enabled()
 
-            (
-                a1q,
-                a1q_scale,
-                expert_tokens_meta,
-                _expert_topk_ids,
-                _expert_topk_weights,
-            ) = self.prepare_finalize.prepare(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                global_num_experts,
-                expert_map,
-                apply_router_weight_on_input,
-                self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                (
+                    a1q,
+                    a1q_scale,
+                    expert_tokens_meta,
+                    _expert_topk_ids,
+                    _expert_topk_weights,
+                ) = self.prepare_finalize.prepare(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts,
+                    expert_map,
+                    apply_router_weight_on_input,
+                    self.fused_experts.quant_config,
+                    defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                )
+            else:
+                # Overlap shared expert compute with all2all dispatch.
+                dbo_maybe_run_recv_hook()
+                prepare_ret = self.prepare_finalize.prepare_async(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts,
+                    expert_map,
+                    apply_router_weight_on_input,
+                    self.fused_experts.quant_config,
+                    defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                )
+
+                # TODO(lucas): refactor this in the alternative schedules followup
+                # currently unpack if we have hook + receiver pair or just
+                # receiver (see finalize_async docstring)
+                hook, receiver = (
+                    prepare_ret
+                    if isinstance(prepare_ret, tuple)
+                    else (None, prepare_ret)
+                )
+
+                if hook is not None:
+                    if dbo_enabled():
+                        # If DBO is being used, register the hook with the ubatch
+                        # context and call it in dbo_maybe_run_recv_hook instead of
+                        #  passing it to the receiver.
+                        dbo_register_recv_hook(hook)
+                        dbo_yield()
+                    else:
+                        hook()
+
+                (
+                    a1q,
+                    a1q_scale,
+                    expert_tokens_meta,
+                    _expert_topk_ids,
+                    _expert_topk_weights,
+                ) = receiver()
+
+        if profile_record is not None and expert_tokens_meta is not None:
+            profile_record.set_local_expert_tokens(
+                expert_tokens_meta.expert_num_tokens
             )
-        else:
-            # Overlap shared expert compute with all2all dispatch.
-            dbo_maybe_run_recv_hook()
-            prepare_ret = self.prepare_finalize.prepare_async(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                global_num_experts,
-                expert_map,
-                apply_router_weight_on_input,
-                self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
-            )
-
-            # TODO(lucas): refactor this in the alternative schedules followup
-            # currently unpack if we have hook + receiver pair or just
-            # receiver (see finalize_async docstring)
-            hook, receiver = (
-                prepare_ret if isinstance(prepare_ret, tuple) else (None, prepare_ret)
-            )
-
-            if hook is not None:
-                if dbo_enabled():
-                    # If DBO is being used, register the hook with the ubatch
-                    # context and call it in dbo_maybe_run_recv_hook instead of
-                    #  passing it to the receiver.
-                    dbo_register_recv_hook(hook)
-                    dbo_yield()
-                else:
-                    hook()
-
-            (
-                a1q,
-                a1q_scale,
-                expert_tokens_meta,
-                _expert_topk_ids,
-                _expert_topk_weights,
-            ) = receiver()
 
         # Maybe prepare gathered topk_ids and topk_weights from other EP ranks.
         topk_ids = topk_ids if _expert_topk_ids is None else _expert_topk_ids
@@ -1207,6 +1231,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
+        profile_record: MoEProfileRecord | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1252,23 +1277,28 @@ class FusedMoEKernelModularImpl:
             ):
                 fused_out = output_alias
 
-        self.fused_experts.apply(
-            output=fused_out,
-            hidden_states=a1q,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            a1q_scale=a1q_scale,
-            a2_scale=self.fused_experts.a2_scale,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        with (
+            profile_record.measure("expert_compute_ms", a1q.device)
+            if profile_record is not None
+            else nullcontext()
+        ):
+            self.fused_experts.apply(
+                output=fused_out,
+                hidden_states=a1q,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=a1q_scale,
+                a2_scale=self.fused_experts.a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
 
         return fused_out
 
@@ -1282,6 +1312,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        profile_record: MoEProfileRecord | None = None,
     ) -> torch.Tensor:
         """
         The _finalize method is a wrapper around self.prepare_finalize.finalize
@@ -1295,48 +1326,53 @@ class FusedMoEKernelModularImpl:
                 shared_experts_input is the original hidden_states (full
                 dimension) needed by the shared expert MLP.
         """
-        if not self.prepare_finalize.supports_async():
-            assert not dbo_enabled()
+        with (
+            profile_record.measure("combine_ms", output.device)
+            if profile_record is not None
+            else nullcontext()
+        ):
+            if not self.prepare_finalize.supports_async():
+                assert not dbo_enabled()
 
-            self.prepare_finalize.finalize(
-                output,
-                fused_out,
-                topk_weights,
-                topk_ids,
-                apply_router_weight_on_input,
-                self.fused_experts.finalize_weight_and_reduce_impl(),
-            )
-        else:
-            finalize_ret = self.prepare_finalize.finalize_async(
-                output,
-                fused_out,
-                topk_weights,
-                topk_ids,
-                apply_router_weight_on_input,
-                self.fused_experts.finalize_weight_and_reduce_impl(),
-            )
-            self._maybe_apply_shared_experts(shared_experts, shared_experts_input)
+                self.prepare_finalize.finalize(
+                    output,
+                    fused_out,
+                    topk_weights,
+                    topk_ids,
+                    apply_router_weight_on_input,
+                    self.fused_experts.finalize_weight_and_reduce_impl(),
+                )
+            else:
+                finalize_ret = self.prepare_finalize.finalize_async(
+                    output,
+                    fused_out,
+                    topk_weights,
+                    topk_ids,
+                    apply_router_weight_on_input,
+                    self.fused_experts.finalize_weight_and_reduce_impl(),
+                )
+                self._maybe_apply_shared_experts(shared_experts, shared_experts_input)
 
-            # TODO(lucas): refactor this in the alternative schedules followup
-            # currently unpack if we have hook + receiver pair or just
-            # receiver (see finalize_async docstring)
-            hook, receiver = (
-                finalize_ret
-                if isinstance(finalize_ret, tuple)
-                else (None, finalize_ret)
-            )
+                # TODO(lucas): refactor this in the alternative schedules followup
+                # currently unpack if we have hook + receiver pair or just
+                # receiver (see finalize_async docstring)
+                hook, receiver = (
+                    finalize_ret
+                    if isinstance(finalize_ret, tuple)
+                    else (None, finalize_ret)
+                )
 
-            if hook is not None:
-                if dbo_enabled():
-                    # If DBO is being used, register the hook with the ubatch
-                    # context and call it in dbo_maybe_run_recv_hook instead of
-                    #  passing it to the receiver.
-                    dbo_register_recv_hook(hook)
-                    dbo_yield()
-                else:
-                    hook()
+                if hook is not None:
+                    if dbo_enabled():
+                        # If DBO is being used, register the hook with the ubatch
+                        # context and call it in dbo_maybe_run_recv_hook instead of
+                        #  passing it to the receiver.
+                        dbo_register_recv_hook(hook)
+                        dbo_yield()
+                    else:
+                        hook()
 
-            receiver()
+                receiver()
 
         return output
 
@@ -1353,6 +1389,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool = False,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        profile_layer_name: str | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1388,6 +1425,21 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
+        profile_record = make_record(
+            kernel_id=self.profile_kernel_id,
+            call_index=self.profile_call_index,
+            layer_name=profile_layer_name,
+            prepare_finalize=self.prepare_finalize,
+            fused_experts=self.fused_experts,
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            global_num_experts=global_num_experts,
+            local_num_experts=local_num_experts,
+            num_dispatchers=self.prepare_finalize.num_dispatchers(),
+            round_robin=self.moe_parallel_config.needs_round_robin_routing_tables,
+        )
+        self.profile_call_index += 1
+
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
             topk_weights,
@@ -1395,6 +1447,7 @@ class FusedMoEKernelModularImpl:
             global_num_experts,
             expert_map,
             apply_router_weight_on_input,
+            profile_record=profile_record,
         )
 
         fused_out = self._fused_experts(
@@ -1412,9 +1465,10 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
+            profile_record=profile_record,
         )
 
-        return self._finalize(
+        result = self._finalize(
             output,
             fused_out,
             hidden_states,
@@ -1423,7 +1477,10 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            profile_record=profile_record,
         )
+        write_record(profile_record)
+        return result
 
 
 @final
@@ -1612,6 +1669,7 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        profile_layer_name: str | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1626,4 +1684,5 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            profile_layer_name=profile_layer_name,
         )
