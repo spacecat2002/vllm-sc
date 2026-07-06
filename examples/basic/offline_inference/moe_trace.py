@@ -71,6 +71,8 @@ def _collect_dp_rank(
     os.environ["VLLM_DP_SIZE"] = str(args.ep_size)
     os.environ["VLLM_DP_MASTER_IP"] = "127.0.0.1"
     os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
+    # Request-level routed-expert capture is not supported by Model Runner V2.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
     from vllm import LLM, SamplingParams
 
@@ -285,6 +287,19 @@ def _expert_load_share(
     return shares
 
 
+def _categorical_expert_colors(num_experts: int) -> np.ndarray:
+    """Generate discrete colors with strong contrast between adjacent IDs."""
+    from matplotlib.colors import hsv_to_rgb
+
+    expert_ids = np.arange(num_experts)
+    # Golden-ratio hue stepping prevents adjacent IDs from receiving nearby
+    # colors. Alternating saturation and value further separates dense bands.
+    hues = np.mod(expert_ids * 0.618033988749895, 1.0)
+    saturations = np.where(expert_ids % 2 == 0, 0.68, 0.92)
+    values = np.where((expert_ids // 2) % 2 == 0, 0.92, 0.72)
+    return hsv_to_rgb(np.column_stack((hues, saturations, values)))
+
+
 def plot_experts(args: argparse.Namespace) -> None:
     import matplotlib.pyplot as plt
 
@@ -293,7 +308,7 @@ def plot_experts(args: argparse.Namespace) -> None:
     num_experts = args.num_experts or int(metadata["num_experts"])
     layers = args.layers or [0]
     prompt_token_counts = metadata["prompt_token_counts"]
-    colors = plt.get_cmap("turbo")(np.linspace(0.02, 0.98, num_experts))
+    colors = _categorical_expert_colors(num_experts)
 
     fig, axes = plt.subplots(
         len(layers),
@@ -313,9 +328,21 @@ def plot_experts(args: argparse.Namespace) -> None:
         )
         sorted_shares = np.sort(shares, axis=1)[:, ::-1]
 
-        axes[row, 0].stackplot(x, shares.T, colors=colors, linewidth=0)
+        axes[row, 0].stackplot(
+            x,
+            shares.T,
+            colors=colors,
+            edgecolor="#202020",
+            linewidth=0.15,
+        )
         axes[row, 0].set_title(f"Layer {layer_id}: fixed expert IDs")
-        axes[row, 1].stackplot(x, sorted_shares.T, colors=colors, linewidth=0)
+        axes[row, 1].stackplot(
+            x,
+            sorted_shares.T,
+            colors=colors,
+            edgecolor="#202020",
+            linewidth=0.15,
+        )
         axes[row, 1].set_title(f"Layer {layer_id}: experts sorted by load")
         axes[row, 0].set_ylabel("Expert load share (%)")
         for axis in axes[row]:
