@@ -47,6 +47,14 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
+    VLLM_MOE_TRACE_DIR: str | None = None
+    VLLM_MOE_TRACE_MAX_STEPS: int = 1
+    VLLM_MOE_TRACE_MAX_TOKENS: int = 4096
+    VLLM_MOE_TRACE_ACTIVATIONS: Literal["none", "input"] = "input"
+    VLLM_MOE_TRACE_ACTIVATION_DTYPE: Literal[
+        "float16", "bfloat16", "float32"
+    ] = "float16"
+    VLLM_MOE_TRACE_TOKEN_SELECTION: Literal["all", "prefill_last"] = "all"
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -815,6 +823,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, vllm will trace function calls
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
+    # Opt-in research traces for MoE routes and router-input activations.
+    "VLLM_MOE_TRACE_DIR": lambda: os.getenv("VLLM_MOE_TRACE_DIR"),
+    "VLLM_MOE_TRACE_MAX_STEPS": lambda: int(
+        os.getenv("VLLM_MOE_TRACE_MAX_STEPS", "1")
+    ),
+    "VLLM_MOE_TRACE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_TRACE_MAX_TOKENS", "4096")
+    ),
+    "VLLM_MOE_TRACE_ACTIVATIONS": lambda: os.getenv(
+        "VLLM_MOE_TRACE_ACTIVATIONS", "input"
+    ),
+    "VLLM_MOE_TRACE_ACTIVATION_DTYPE": lambda: os.getenv(
+        "VLLM_MOE_TRACE_ACTIVATION_DTYPE", "float16"
+    ),
+    "VLLM_MOE_TRACE_TOKEN_SELECTION": lambda: os.getenv(
+        "VLLM_MOE_TRACE_TOKEN_SELECTION", "all"
+    ),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
@@ -2126,6 +2151,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+        "VLLM_MOE_TRACE_DIR",
+        "VLLM_MOE_TRACE_MAX_STEPS",
+        "VLLM_MOE_TRACE_MAX_TOKENS",
+        "VLLM_MOE_TRACE_ACTIVATIONS",
+        "VLLM_MOE_TRACE_ACTIVATION_DTYPE",
+        "VLLM_MOE_TRACE_TOKEN_SELECTION",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

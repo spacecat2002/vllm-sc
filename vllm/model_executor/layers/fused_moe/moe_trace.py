@@ -10,13 +10,13 @@ intended for short, eager-mode research runs only.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -32,8 +32,7 @@ ActivationMode = Literal["none", "input"]
 TokenSelection = Literal["all", "prefill_last"]
 
 
-def _positive_int_env(name: str, default: int) -> int:
-    value = int(os.getenv(name, str(default)))
+def _positive_int_env(name: str, value: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero, got {value}")
     return value
@@ -56,17 +55,17 @@ class MoETraceConfig:
 
     @classmethod
     def from_env(cls) -> MoETraceConfig | None:
-        output_dir = os.getenv(_TRACE_DIR_ENV)
+        output_dir = envs.VLLM_MOE_TRACE_DIR
         if not output_dir:
             return None
 
-        activations = os.getenv(_ACTIVATIONS_ENV, "input")
+        activations = envs.VLLM_MOE_TRACE_ACTIVATIONS
         if activations not in ("none", "input"):
             raise ValueError(
                 f"{_ACTIVATIONS_ENV} must be 'none' or 'input', got {activations!r}"
             )
 
-        dtype_name = os.getenv(_ACTIVATION_DTYPE_ENV, "float16")
+        dtype_name = envs.VLLM_MOE_TRACE_ACTIVATION_DTYPE
         dtypes = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
@@ -78,7 +77,7 @@ class MoETraceConfig:
                 f"got {dtype_name!r}"
             )
 
-        token_selection = os.getenv(_TOKEN_SELECTION_ENV, "all")
+        token_selection = envs.VLLM_MOE_TRACE_TOKEN_SELECTION
         if token_selection not in ("all", "prefill_last"):
             raise ValueError(
                 f"{_TOKEN_SELECTION_ENV} must be 'all' or 'prefill_last', "
@@ -87,8 +86,12 @@ class MoETraceConfig:
 
         return cls(
             output_dir=Path(output_dir).expanduser().resolve(),
-            max_steps=_positive_int_env(_MAX_STEPS_ENV, 1),
-            max_tokens=_positive_int_env(_MAX_TOKENS_ENV, 4096),
+            max_steps=_positive_int_env(
+                _MAX_STEPS_ENV, envs.VLLM_MOE_TRACE_MAX_STEPS
+            ),
+            max_tokens=_positive_int_env(
+                _MAX_TOKENS_ENV, envs.VLLM_MOE_TRACE_MAX_TOKENS
+            ),
             activations=activations,  # type: ignore[arg-type]
             activation_dtype=dtypes[dtype_name],
             token_selection=token_selection,  # type: ignore[arg-type]
