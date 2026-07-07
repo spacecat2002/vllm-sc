@@ -52,6 +52,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Isolated MoE EP distribution benchmark."
     )
+    parser.add_argument(
+        "--model-preset",
+        choices=("qwen3-30b-a3b",),
+        help=(
+            "Fill expert-related shape arguments from a known model preset. "
+            "Currently supports Qwen3-30B-A3B routed experts."
+        ),
+    )
     parser.add_argument("--tokens", type=int, default=1024)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--intermediate-size", type=int, default=14336)
@@ -133,7 +141,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Rendezvous port for internal multi-process launch.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.model_preset == "qwen3-30b-a3b":
+        args.hidden_size = 2048
+        args.intermediate_size = 768
+        args.num_experts = 128
+        args.top_k = 8
+        args.dtype = "bfloat16"
+    return args
 
 
 def dtype_from_name(name: str) -> torch.dtype:
