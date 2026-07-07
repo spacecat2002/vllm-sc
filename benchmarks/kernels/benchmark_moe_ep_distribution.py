@@ -64,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("allgather_reducescatter", "deepep_high_throughput"),
-        default="allgather_reducescatter",
+        choices=("allgather_reducescatter", "deepep_high_throughput", "deepep_low_latency"),
+        default="deepep_low_latency",
     )
     parser.add_argument(
         "--pattern",
