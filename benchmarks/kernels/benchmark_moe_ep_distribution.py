@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import statistics
 import time
 from collections import defaultdict
@@ -19,6 +20,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -29,7 +31,7 @@ from vllm.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
@@ -74,6 +76,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-jsonl", type=Path)
+    parser.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=None,
+        help=(
+            "Number of local worker processes to spawn when not launched with "
+            "torchrun. Defaults to torch.cuda.device_count(). Ignored when "
+            "RANK/WORLD_SIZE/LOCAL_RANK are already set."
+        ),
+    )
+    parser.add_argument(
+        "--master-addr",
+        default="127.0.0.1",
+        help="Rendezvous address for internal multi-process launch.",
+    )
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=None,
+        help="Rendezvous port for internal multi-process launch.",
+    )
     return parser.parse_args()
 
 
@@ -202,7 +225,12 @@ def make_expert_map(
     return expert_map
 
 
-def make_vllm_config(args: argparse.Namespace, world_size: int, rank: int):
+def make_vllm_config(
+    args: argparse.Namespace,
+    world_size: int,
+    rank: int,
+    local_rank: int,
+):
     vllm_config = VllmConfig()
     parallel_config = vllm_config.parallel_config
     parallel_config.data_parallel_size = world_size
@@ -211,10 +239,7 @@ def make_vllm_config(args: argparse.Namespace, world_size: int, rank: int):
     parallel_config.is_moe_model = True
     parallel_config.all2all_backend = args.backend
     parallel_config.distributed_executor_backend = "external_launcher"
-    vllm_config.device_config.device = torch.device(
-        "cuda",
-        int(os.environ["LOCAL_RANK"]),
-    )
+    vllm_config.device_config.device = torch.device("cuda", local_rank)
     return vllm_config
 
 
@@ -505,14 +530,35 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
     )
 
 
-def main() -> None:
-    args = parse_args()
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return int(sock.getsockname()[1])
+
+
+def _set_distributed_env(
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    master_addr: str,
+    master_port: int,
+) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+
+
+def _run_worker(
+    args: argparse.Namespace,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA.")
 
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ["LOCAL_RANK"])
     if args.num_experts % world_size != 0:
         raise ValueError("--num-experts must be divisible by WORLD_SIZE.")
 
@@ -520,7 +566,7 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     dtype = dtype_from_name(args.dtype)
 
-    vllm_config = make_vllm_config(args, world_size, rank)
+    vllm_config = make_vllm_config(args, world_size, rank, local_rank)
     with set_current_vllm_config(vllm_config):
         init_distributed_environment(
             world_size=world_size,
@@ -546,13 +592,8 @@ def main() -> None:
             num_tokens=args.tokens,
             num_tokens_across_dp=num_tokens_across_dp,
         ):
-            for _ in range(args.warmup):
-                run_one_iter(args, kernel, tensors, rank, world_size, device, -1)
-            dist.barrier()
-
-            local_records = []
-            for iteration in range(args.iters):
-                local_records.append(
+            def run_iterations() -> list[dict[str, Any]]:
+                for _ in range(args.warmup):
                     run_one_iter(
                         args,
                         kernel,
@@ -560,10 +601,32 @@ def main() -> None:
                         rank,
                         world_size,
                         device,
-                        iteration,
+                        -1,
                     )
-                )
-            dist.barrier()
+                dist.barrier()
+
+                records = []
+                for iteration in range(args.iters):
+                    records.append(
+                        run_one_iter(
+                            args,
+                            kernel,
+                            tensors,
+                            rank,
+                            world_size,
+                            device,
+                            iteration,
+                        )
+                    )
+                dist.barrier()
+                return records
+
+            ctx = get_forward_context()
+            if ctx.dp_metadata is None:
+                local_records = run_iterations()
+            else:
+                with ctx.dp_metadata.sp_local_sizes(sequence_parallel_size=1):
+                    local_records = run_iterations()
 
         gathered: list[Any] | None = (
             [None for _ in range(world_size)] if rank == 0 else None
@@ -578,6 +641,77 @@ def main() -> None:
                 write_jsonl(args.output_jsonl, records + aggregates)
                 print(f"Wrote JSONL: {args.output_jsonl}")
             print_summary(args, aggregates)
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _destroy_distributed_if_initialized() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _spawn_worker(
+    local_rank: int,
+    args: argparse.Namespace,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+) -> None:
+    rank = local_rank
+    _set_distributed_env(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        master_addr=master_addr,
+        master_port=master_port,
+    )
+    try:
+        _run_worker(args, rank, world_size, local_rank)
+    finally:
+        _destroy_distributed_if_initialized()
+
+
+def _launched_with_torchrun() -> bool:
+    return all(name in os.environ for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
+
+
+def main() -> None:
+    args = parse_args()
+
+    if _launched_with_torchrun():
+        try:
+            _run_worker(
+                args=args,
+                rank=int(os.environ["RANK"]),
+                world_size=int(os.environ["WORLD_SIZE"]),
+                local_rank=int(os.environ["LOCAL_RANK"]),
+            )
+        finally:
+            _destroy_distributed_if_initialized()
+        return
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("This benchmark requires CUDA.")
+
+    world_size = args.nproc_per_node or torch.cuda.device_count()
+    if world_size <= 0:
+        raise ValueError("--nproc-per-node must be positive.")
+    if world_size > torch.cuda.device_count():
+        raise ValueError(
+            f"--nproc-per-node={world_size} exceeds visible CUDA device count "
+            f"{torch.cuda.device_count()}."
+        )
+    if args.num_experts % world_size != 0:
+        raise ValueError("--num-experts must be divisible by --nproc-per-node.")
+
+    master_port = args.master_port or _find_free_port()
+    mp.spawn(
+        _spawn_worker,
+        args=(args, world_size, args.master_addr, master_port),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 if __name__ == "__main__":
