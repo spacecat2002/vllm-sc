@@ -64,13 +64,40 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("allgather_reducescatter", "deepep_high_throughput", "deepep_low_latency"),
+        choices=(
+            "allgather_reducescatter",
+            "deepep_high_throughput",
+            "deepep_low_latency",
+        ),
         default="deepep_low_latency",
     )
     parser.add_argument(
         "--pattern",
-        choices=("balanced", "concentrated", "local", "remote", "random"),
+        choices=(
+            "balanced",
+            "concentrated",
+            "local",
+            "remote",
+            "random",
+            "skewed",
+        ),
         default="balanced",
+    )
+    parser.add_argument(
+        "--hot-rank",
+        type=int,
+        default=0,
+        help="Target rank that receives the hot share for --pattern skewed.",
+    )
+    parser.add_argument(
+        "--hot-share",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of top-k assignments sent to --hot-rank for "
+            "--pattern skewed. Use 1 / world_size for balanced-like routing "
+            "and 1.0 for concentrated-like routing."
+        ),
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -134,6 +161,48 @@ def cycle_pool(pool: list[int], rows: int, cols: int, offset: int) -> torch.Tens
     return torch.tensor(values, dtype=torch.int64).view(rows, cols)
 
 
+def make_rank_skewed_ids(
+    tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    world_size: int,
+    source_rank: int,
+    hot_rank: int,
+    hot_share: float,
+) -> torch.Tensor:
+    total = tokens * top_k
+    normalized_hot_rank = hot_rank % world_size
+    counts = [0] * world_size
+    if world_size == 1:
+        counts[0] = total
+    else:
+        hot_count = round(total * hot_share)
+        counts[normalized_hot_rank] = hot_count
+        other_ranks = [
+            rank for rank in range(world_size) if rank != normalized_hot_rank
+        ]
+        for index in range(total - hot_count):
+            counts[other_ranks[index % len(other_ranks)]] += 1
+
+    targets = []
+    remaining = counts[:]
+    start_rank = source_rank % world_size
+    while sum(remaining) > 0:
+        for offset in range(world_size):
+            target_rank = (start_rank + offset) % world_size
+            if remaining[target_rank] > 0:
+                targets.append(target_rank)
+                remaining[target_rank] -= 1
+
+    seen_per_rank = [0] * world_size
+    expert_ids = []
+    for target_rank in targets:
+        local_expert = seen_per_rank[target_rank] % num_local_experts
+        expert_ids.append(target_rank * num_local_experts + local_expert)
+        seen_per_rank[target_rank] += 1
+    return torch.tensor(expert_ids, dtype=torch.int64).view(tokens, top_k)
+
+
 def make_topk_ids(
     pattern: str,
     tokens: int,
@@ -143,6 +212,8 @@ def make_topk_ids(
     world_size: int,
     device: torch.device,
     seed: int,
+    hot_rank: int,
+    hot_share: float,
 ) -> torch.Tensor:
     num_local_experts = num_experts // world_size
     if pattern == "balanced":
@@ -162,6 +233,16 @@ def make_topk_ids(
         generator = torch.Generator(device="cpu")
         generator.manual_seed(seed + rank)
         ids = torch.randint(num_experts, (tokens, top_k), generator=generator)
+    elif pattern == "skewed":
+        ids = make_rank_skewed_ids(
+            tokens,
+            top_k,
+            num_local_experts,
+            world_size,
+            rank,
+            hot_rank,
+            hot_share,
+        )
     else:
         raise ValueError(f"Unknown pattern: {pattern}")
     return ids.to(device=device)
@@ -315,6 +396,8 @@ def make_inputs(
         world_size,
         device,
         args.seed,
+        args.hot_rank,
+        args.hot_share,
     )
     topk_weights = torch.full(
         (args.tokens, args.top_k),
@@ -355,6 +438,13 @@ def run_one_iter(
         args.num_experts,
         world_size,
         round_robin=False,
+    )
+    total_assignments = sum(target_assignments)
+    local_assignments = target_assignments[rank]
+    remote_assignment_share = (
+        (total_assignments - local_assignments) / total_assignments
+        if total_assignments
+        else 0.0
     )
     output = torch.empty_like(hidden_states)
     local_num_experts = tensors["w1"].shape[0]
@@ -442,6 +532,7 @@ def run_one_iter(
         "source_target_assignments": target_assignments,
         "source_target_unique_tokens": target_unique_tokens,
         "source_distribution": distribution_metrics(target_assignments),
+        "remote_assignment_share": remote_assignment_share,
         "local_expert_tokens": local_expert_tokens,
         "received_tokens": sum(local_expert_tokens),
     }
@@ -459,8 +550,14 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         combine = [r["combine_ms"] for r in iter_records]
         total = [r["total_ms"] for r in iter_records]
         received = [r["received_tokens"] for r in iter_records]
+        remote_shares = [r["remote_assignment_share"] for r in iter_records]
+        target_assignments = [0] * int(iter_records[0]["world_size"])
+        for record in iter_records:
+            for target_rank, count in enumerate(record["source_target_assignments"]):
+                target_assignments[target_rank] += count
         mean_compute = statistics.mean(compute)
         mean_received = statistics.mean(received)
+        target_metrics = distribution_metrics(target_assignments)
         aggregates.append(
             {
                 "record_type": "aggregate",
@@ -481,6 +578,9 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "received_tokens_imbalance": max(received) / mean_received
                 if mean_received
                 else 0.0,
+                "mean_remote_assignment_share": statistics.mean(remote_shares),
+                "target_assignment_imbalance": target_metrics["imbalance"],
+                "target_assignment_max_share": target_metrics["max_share"],
             }
         )
     return aggregates
@@ -498,7 +598,8 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
         return
     print(
         "iter max_total max_dispatch max_compute max_combine "
-        "compute_imbalance recv_min recv_max recv_imbalance"
+        "compute_imbalance recv_min recv_max recv_imbalance "
+        "remote_share target_imbalance"
     )
     for record in aggregates:
         print(
@@ -510,7 +611,9 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
             f"{record['compute_imbalance']:>17.3f} "
             f"{record['received_tokens_min']:>8} "
             f"{record['received_tokens_max']:>8} "
-            f"{record['received_tokens_imbalance']:>14.3f}"
+            f"{record['received_tokens_imbalance']:>14.3f} "
+            f"{record['mean_remote_assignment_share']:>12.3f} "
+            f"{record['target_assignment_imbalance']:>16.3f}"
         )
 
     print()
@@ -678,6 +781,9 @@ def _launched_with_torchrun() -> bool:
 
 def main() -> None:
     args = parse_args()
+
+    if not 0.0 <= args.hot_share <= 1.0:
+        raise ValueError("--hot-share must be between 0.0 and 1.0.")
 
     if _launched_with_torchrun():
         try:
