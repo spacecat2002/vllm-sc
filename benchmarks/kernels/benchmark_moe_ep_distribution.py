@@ -102,6 +102,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--stage-barrier",
+        action="store_true",
+        help=(
+            "Synchronize all ranks before each measured stage. This removes "
+            "arrival skew from dispatch/compute/combine timings, at the cost "
+            "of making the benchmark less like the original pipeline."
+        ),
+    )
     parser.add_argument("--output-jsonl", type=Path)
     parser.add_argument(
         "--nproc-per-node",
@@ -148,8 +157,20 @@ def sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def time_stage(device: torch.device, fn) -> tuple[Any, float]:
+def sync_stage_start(device: torch.device, use_barrier: bool) -> None:
     sync(device)
+    if use_barrier:
+        dist.barrier()
+        sync(device)
+
+
+def time_stage(
+    device: torch.device,
+    fn,
+    *,
+    use_barrier: bool = False,
+) -> tuple[Any, float]:
+    sync_stage_start(device, use_barrier)
     start = time.perf_counter()
     result = fn()
     sync(device)
@@ -477,7 +498,7 @@ def run_one_iter(
         expert_tokens_meta,
         dispatched_topk_ids,
         dispatched_topk_weights,
-    ), dispatch_ms = time_stage(device, prepare)
+    ), dispatch_ms = time_stage(device, prepare, use_barrier=args.stage_barrier)
 
     def compute():
         return kernel.impl._fused_experts(
@@ -497,7 +518,11 @@ def run_one_iter(
             output_alias=output,
         )
 
-    fused_out, compute_ms = time_stage(device, compute)
+    fused_out, compute_ms = time_stage(
+        device,
+        compute,
+        use_barrier=args.stage_barrier,
+    )
 
     def finalize():
         return kernel.impl._finalize(
@@ -511,7 +536,7 @@ def run_one_iter(
             None,
         )
 
-    _, combine_ms = time_stage(device, finalize)
+    _, combine_ms = time_stage(device, finalize, use_barrier=args.stage_barrier)
 
     if expert_tokens_meta is not None:
         local_expert_tokens = [
@@ -528,6 +553,7 @@ def run_one_iter(
         "record_type": "rank",
         "pattern": args.pattern,
         "backend": args.backend,
+        "stage_barrier": args.stage_barrier,
         "iter": iteration,
         "rank": rank,
         "world_size": world_size,
