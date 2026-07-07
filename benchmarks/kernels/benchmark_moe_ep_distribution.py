@@ -135,6 +135,14 @@ def dtype_from_name(name: str) -> torch.dtype:
     }[name]
 
 
+def dtype_nbytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def bytes_to_mib(num_bytes: int | float) -> float:
+    return float(num_bytes) / (1024 * 1024)
+
+
 def sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -446,6 +454,10 @@ def run_one_iter(
         if total_assignments
         else 0.0
     )
+    remote_unique_tokens = sum(target_unique_tokens) - target_unique_tokens[rank]
+    token_bytes = args.hidden_size * dtype_nbytes(hidden_states.dtype)
+    dispatch_remote_bytes = remote_unique_tokens * token_bytes
+    combine_remote_bytes = dispatch_remote_bytes
     output = torch.empty_like(hidden_states)
     local_num_experts = tensors["w1"].shape[0]
 
@@ -533,6 +545,11 @@ def run_one_iter(
         "source_target_unique_tokens": target_unique_tokens,
         "source_distribution": distribution_metrics(target_assignments),
         "remote_assignment_share": remote_assignment_share,
+        "remote_unique_tokens": remote_unique_tokens,
+        "token_bytes": token_bytes,
+        "dispatch_remote_bytes": dispatch_remote_bytes,
+        "combine_remote_bytes": combine_remote_bytes,
+        "a2a_remote_bytes": dispatch_remote_bytes + combine_remote_bytes,
         "local_expert_tokens": local_expert_tokens,
         "received_tokens": sum(local_expert_tokens),
     }
@@ -551,12 +568,20 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         total = [r["total_ms"] for r in iter_records]
         received = [r["received_tokens"] for r in iter_records]
         remote_shares = [r["remote_assignment_share"] for r in iter_records]
+        dispatch_remote_bytes = [r["dispatch_remote_bytes"] for r in iter_records]
+        combine_remote_bytes = [r["combine_remote_bytes"] for r in iter_records]
+        a2a_remote_bytes = [r["a2a_remote_bytes"] for r in iter_records]
         target_assignments = [0] * int(iter_records[0]["world_size"])
+        remote_recv_bytes = [0] * int(iter_records[0]["world_size"])
         for record in iter_records:
             for target_rank, count in enumerate(record["source_target_assignments"]):
                 target_assignments[target_rank] += count
+            for target_rank, tokens in enumerate(record["source_target_unique_tokens"]):
+                if target_rank != record["rank"]:
+                    remote_recv_bytes[target_rank] += tokens * record["token_bytes"]
         mean_compute = statistics.mean(compute)
         mean_received = statistics.mean(received)
+        mean_remote_recv_bytes = statistics.mean(remote_recv_bytes)
         target_metrics = distribution_metrics(target_assignments)
         aggregates.append(
             {
@@ -581,6 +606,15 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "mean_remote_assignment_share": statistics.mean(remote_shares),
                 "target_assignment_imbalance": target_metrics["imbalance"],
                 "target_assignment_max_share": target_metrics["max_share"],
+                "dispatch_remote_bytes_total": sum(dispatch_remote_bytes),
+                "dispatch_remote_bytes_max": max(dispatch_remote_bytes),
+                "combine_remote_bytes_total": sum(combine_remote_bytes),
+                "a2a_remote_bytes_total": sum(a2a_remote_bytes),
+                "remote_recv_bytes_max": max(remote_recv_bytes),
+                "remote_recv_bytes_imbalance": max(remote_recv_bytes)
+                / mean_remote_recv_bytes
+                if mean_remote_recv_bytes
+                else 0.0,
             }
         )
     return aggregates
@@ -599,7 +633,7 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
     print(
         "iter max_total max_dispatch max_compute max_combine "
         "compute_imbalance recv_min recv_max recv_imbalance "
-        "remote_share target_imbalance"
+        "remote_share target_imbalance dispatch_mib a2a_mib max_recv_mib"
     )
     for record in aggregates:
         print(
@@ -613,7 +647,10 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
             f"{record['received_tokens_max']:>8} "
             f"{record['received_tokens_imbalance']:>14.3f} "
             f"{record['mean_remote_assignment_share']:>12.3f} "
-            f"{record['target_assignment_imbalance']:>16.3f}"
+            f"{record['target_assignment_imbalance']:>16.3f} "
+            f"{bytes_to_mib(record['dispatch_remote_bytes_total']):>12.3f} "
+            f"{bytes_to_mib(record['a2a_remote_bytes_total']):>7.3f} "
+            f"{bytes_to_mib(record['remote_recv_bytes_max']):>12.3f}"
         )
 
     print()
