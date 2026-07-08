@@ -346,6 +346,7 @@ def maybe_attach_moe_trace(
         return None
 
     model_modules = dict(model.named_modules()) if model is not None else {}
+    model_parameters = dict(model.named_parameters()) if model is not None else {}
 
     def _get_module_by_name(name: str) -> torch.nn.Module | None:
         if model is None:
@@ -368,19 +369,92 @@ def maybe_attach_moe_trace(
             return suffix_matches[0]
         return None
 
-    def _find_next_gate(
+    def _find_named_parameter(name: str) -> torch.nn.Parameter | None:
+        if name in model_parameters:
+            return model_parameters[name]
+        if name.startswith("model."):
+            stripped_name = name.removeprefix("model.")
+            if stripped_name in model_parameters:
+                return model_parameters[stripped_name]
+        suffix_matches = [
+            parameter
+            for parameter_name, parameter in model_parameters.items()
+            if (
+                parameter_name.endswith(f".{name}")
+                or name.endswith(f".{parameter_name}")
+            )
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        return None
+
+    def _gate_candidates(next_name: str) -> list[str]:
+        candidates = []
+        if next_name.endswith(".experts"):
+            candidates.append(next_name.removesuffix(".experts") + ".gate")
+        if ".experts" in next_name:
+            candidates.append(next_name.rsplit(".experts", 1)[0] + ".gate")
+        # Qwen-style layer names are commonly model.layers.N.mlp.experts.
+        parts = next_name.split(".")
+        if "layers" in parts:
+            layer_pos = parts.index("layers")
+            if layer_pos + 1 < len(parts):
+                layer_id = parts[layer_pos + 1]
+                candidates.append(f"model.layers.{layer_id}.mlp.gate")
+                candidates.append(f"layers.{layer_id}.mlp.gate")
+        return list(dict.fromkeys(candidates))
+
+    def _find_next_gate_projector(
         next_name: str,
         next_module: FusedMoE,
-    ) -> tuple[torch.nn.Module | None, str]:
+        fse_enabled: bool,
+    ) -> tuple[Callable[[torch.Tensor], torch.Tensor] | None, str]:
         gate = getattr(next_module.runner, "gate", None)
         if gate is not None:
-            return gate, "runner.gate"
-        if next_name.endswith(".experts"):
-            parent_name = next_name.removesuffix(".experts")
-            parent = _get_module_by_name(parent_name)
+            if fse_enabled:
+
+                def _project_with_fused_gate(hidden_states: torch.Tensor):
+                    next_module.runner._maybe_fuse_gate_weights()
+                    return torch.nn.functional.linear(
+                        hidden_states, next_module.runner._combined_gate_weight
+                    )
+
+                return _project_with_fused_gate, "runner.fused_gate"
+
+            def _project_with_runner_gate(hidden_states: torch.Tensor):
+                router_logits, _ = gate(hidden_states)
+                return router_logits
+
+            return _project_with_runner_gate, "runner.gate"
+
+        for gate_name in _gate_candidates(next_name):
+            parent = _get_module_by_name(gate_name.rsplit(".", 1)[0])
             gate = getattr(parent, "gate", None) if parent is not None else None
             if gate is not None:
-                return gate, f"{parent_name}.gate"
+                def _project_with_parent_gate(
+                    hidden_states: torch.Tensor,
+                    _gate=gate,
+                ):
+                    router_logits, _ = _gate(hidden_states)
+                    return router_logits
+
+                return _project_with_parent_gate, gate_name
+
+            weight = _find_named_parameter(gate_name + ".weight")
+            if weight is not None:
+                bias = _find_named_parameter(gate_name + ".bias")
+
+                def _project_with_gate_weight(
+                    hidden_states: torch.Tensor,
+                    _weight=weight,
+                    _bias=bias,
+                ):
+                    if hidden_states.dtype != _weight.dtype:
+                        hidden_states = hidden_states.to(_weight.dtype)
+                    return torch.nn.functional.linear(hidden_states, _weight, _bias)
+
+                return _project_with_gate_weight, gate_name + ".weight"
+
         return None, ""
 
     layer_names = {module.layer_id: name for name, module in layers}
@@ -388,8 +462,6 @@ def maybe_attach_moe_trace(
     next_gate_missing_gate_layers = []
     next_gate_diagnostics = []
     if config.trace_next_gate:
-        import torch.nn.functional as F
-
         sorted_layers = sorted(layers, key=lambda item: item[1].layer_id)
         for (_, module), (next_name, next_module) in zip(
             sorted_layers,
@@ -397,17 +469,22 @@ def maybe_attach_moe_trace(
         ):
             runner = next_module.runner
             runner_gate = getattr(runner, "gate", None)
-            gate, gate_source = _find_next_gate(next_name, next_module)
+            gate_projector, gate_source = _find_next_gate_projector(
+                next_name,
+                next_module,
+                bool(getattr(runner, "_fse_fuse_gate", False)),
+            )
             diagnostic = {
                 "layer_id": module.layer_id,
                 "next_layer_id": next_module.layer_id,
                 "next_layer_name": next_name,
                 "runner_gate": runner_gate is not None,
-                "gate_found": gate is not None,
+                "gate_found": gate_projector is not None,
                 "gate_source": gate_source,
+                "gate_candidates": _gate_candidates(next_name),
             }
             next_gate_diagnostics.append(diagnostic)
-            if gate is None:
+            if gate_projector is None:
                 next_gate_missing_gate_layers.append(
                     (module.layer_id, next_module.layer_id)
                 )
@@ -417,16 +494,9 @@ def maybe_attach_moe_trace(
             def _predict_next_topk(
                 hidden_states,
                 _next_module=next_module,
-                _runner=runner,
-                _gate=gate,
+                _gate_projector=gate_projector,
             ):
-                if getattr(_runner, "_fse_fuse_gate", False):
-                    _runner._maybe_fuse_gate_weights()
-                    router_logits = F.linear(
-                        hidden_states, _runner._combined_gate_weight
-                    )
-                else:
-                    router_logits, _ = _gate(hidden_states)
+                router_logits = _gate_projector(hidden_states)
                 router = _next_module.router
                 _, topk_ids = router._compute_routing(
                     hidden_states,
