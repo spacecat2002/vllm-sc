@@ -93,7 +93,6 @@ def _collect_dp_rank(
         enable_chunked_prefill=False,
         enforce_eager=True,
         enable_return_routed_experts=True,
-        load_format="dummy",
     )
     sampling_params = SamplingParams(
         temperature=0,
