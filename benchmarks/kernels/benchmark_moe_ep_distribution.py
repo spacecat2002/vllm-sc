@@ -730,6 +730,77 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def make_sweep_summary_row(
+    args: argparse.Namespace,
+    aggregates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary_aggregates = trim_aggregates(aggregates, args.trim_ratio)
+    return {
+        "hot_share": aggregates[0]["hot_share"],
+        "iters": len(aggregates),
+        "trimmed_iters": len(summary_aggregates),
+        "mean_max_total_ms": statistics.mean(
+            r["max_total_ms"] for r in summary_aggregates
+        ),
+        "mean_max_dispatch_ms": statistics.mean(
+            r["max_dispatch_ms"] for r in summary_aggregates
+        ),
+        "mean_max_compute_ms": statistics.mean(
+            r["max_expert_compute_ms"] for r in summary_aggregates
+        ),
+        "mean_max_combine_ms": statistics.mean(
+            r["max_combine_ms"] for r in summary_aggregates
+        ),
+        "mean_compute_imbalance": statistics.mean(
+            r["compute_imbalance"] for r in summary_aggregates
+        ),
+        "mean_remote_share": statistics.mean(
+            r["mean_remote_assignment_share"] for r in summary_aggregates
+        ),
+        "mean_target_imbalance": statistics.mean(
+            r["target_assignment_imbalance"] for r in summary_aggregates
+        ),
+        "mean_dispatch_mib": statistics.mean(
+            bytes_to_mib(r["dispatch_remote_bytes_total"])
+            for r in summary_aggregates
+        ),
+        "mean_a2a_mib": statistics.mean(
+            bytes_to_mib(r["a2a_remote_bytes_total"]) for r in summary_aggregates
+        ),
+        "mean_max_recv_mib": statistics.mean(
+            bytes_to_mib(r["remote_recv_bytes_max"]) for r in summary_aggregates
+        ),
+    }
+
+
+def print_sweep_summary(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    print()
+    print("sweep summary")
+    print(
+        "hot_share iters trimmed mean_total mean_dispatch mean_compute "
+        "mean_combine compute_imbalance remote_share target_imbalance "
+        "dispatch_mib a2a_mib max_recv_mib"
+    )
+    for row in rows:
+        print(
+            f"{row['hot_share']:>9.3f} "
+            f"{row['iters']:>5} "
+            f"{row['trimmed_iters']:>7} "
+            f"{row['mean_max_total_ms']:>10.3f} "
+            f"{row['mean_max_dispatch_ms']:>13.3f} "
+            f"{row['mean_max_compute_ms']:>12.3f} "
+            f"{row['mean_max_combine_ms']:>12.3f} "
+            f"{row['mean_compute_imbalance']:>17.3f} "
+            f"{row['mean_remote_share']:>12.3f} "
+            f"{row['mean_target_imbalance']:>16.3f} "
+            f"{row['mean_dispatch_mib']:>12.3f} "
+            f"{row['mean_a2a_mib']:>7.3f} "
+            f"{row['mean_max_recv_mib']:>12.3f}"
+        )
+
+
 def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) -> None:
     if not aggregates:
         return
@@ -832,6 +903,7 @@ def _run_worker(
         )
         hot_share_values = args.hot_share_values
         output_records: list[dict[str, Any]] = []
+        sweep_summary_rows: list[dict[str, Any]] = []
 
         with set_forward_context(
             None,
@@ -893,7 +965,13 @@ def _run_worker(
                     ]
                     aggregates = aggregate_records(records)
                     output_records.extend(records + aggregates)
+                    sweep_summary_rows.append(
+                        make_sweep_summary_row(args, aggregates)
+                    )
                     print_summary(args, aggregates)
+
+            if rank == 0:
+                print_sweep_summary(sweep_summary_rows)
 
         if rank == 0 and args.output_jsonl is not None:
             write_jsonl(args.output_jsonl, output_records)
