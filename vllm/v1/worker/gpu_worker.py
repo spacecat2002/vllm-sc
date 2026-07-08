@@ -741,6 +741,7 @@ class Worker(WorkerBase):
             static_forward_context=(
                 self.vllm_config.compilation_config.static_forward_context
             ),
+            model=self.model_runner.get_model(),
         )
 
         # Reset the seed to ensure that the random state is not affected by

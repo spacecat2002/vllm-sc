@@ -315,6 +315,7 @@ def maybe_attach_moe_trace(
     *,
     enforce_eager: bool,
     static_forward_context: dict[str, Any],
+    model: torch.nn.Module | None = None,
 ) -> MoETraceCollector | None:
     """Attach a trace collector to every standard FusedMoE router if enabled."""
     config = MoETraceConfig.from_env()
@@ -341,18 +342,52 @@ def maybe_attach_moe_trace(
         )
         return None
 
+    def _get_module_by_name(name: str) -> torch.nn.Module | None:
+        if model is None:
+            return None
+        if name == "":
+            return model
+        module = model
+        for part in name.split("."):
+            if part.isdigit():
+                try:
+                    module = module[int(part)]  # type: ignore[index]
+                except (IndexError, TypeError):
+                    return None
+            elif hasattr(module, part):
+                module = getattr(module, part)
+            else:
+                return None
+        return module
+
+    def _find_next_gate(
+        next_name: str,
+        next_module: FusedMoE,
+    ) -> torch.nn.Module | None:
+        gate = getattr(next_module.runner, "gate", None)
+        if gate is not None:
+            return gate
+        if next_name.endswith(".experts"):
+            parent_name = next_name.removesuffix(".experts")
+            parent = _get_module_by_name(parent_name)
+            gate = getattr(parent, "gate", None) if parent is not None else None
+            if gate is not None:
+                return gate
+        return None
+
     layer_names = {module.layer_id: name for name, module in layers}
     next_gate_predictors = {}
     next_gate_missing_gate_layers = []
     if config.trace_next_gate:
         import torch.nn.functional as F
 
-        for (_, module), (_, next_module) in zip(
-            sorted(layers, key=lambda item: item[1].layer_id),
-            sorted(layers, key=lambda item: item[1].layer_id)[1:],
+        sorted_layers = sorted(layers, key=lambda item: item[1].layer_id)
+        for (_, module), (next_name, next_module) in zip(
+            sorted_layers,
+            sorted_layers[1:],
         ):
             runner = next_module.runner
-            gate = getattr(runner, "gate", None)
+            gate = _find_next_gate(next_name, next_module)
             if gate is None:
                 next_gate_missing_gate_layers.append(
                     (module.layer_id, next_module.layer_id)
