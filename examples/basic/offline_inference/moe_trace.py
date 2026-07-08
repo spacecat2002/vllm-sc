@@ -16,6 +16,9 @@ Examples::
         plot-activations --trace-dir /tmp/qwen3_moe_trace \
         --metric cka --phase prefill
 
+    .venv/bin/python examples/basic/offline_inference/moe_trace.py \
+        plot-route-similarity --trace-dir /tmp/qwen3_moe_trace --phase prefill
+
 ``collect`` intentionally uses eager mode and writes tensors synchronously.
 It is a research utility, not a serving benchmark.
 """
@@ -287,6 +290,136 @@ def _expert_load_share(
     return shares
 
 
+def _route_ids_for_phase(
+    routes: np.ndarray,
+    prompt_token_count: int,
+    phase: str,
+) -> np.ndarray:
+    if phase == "prefill":
+        return routes[:prompt_token_count]
+    if phase == "decode":
+        return routes[prompt_token_count:]
+    return routes
+
+
+def _expert_load_counts(
+    layer_routes: np.ndarray,
+    num_experts: int,
+) -> np.ndarray:
+    ids = layer_routes.reshape(-1)
+    ids = ids[(ids >= 0) & (ids < num_experts)]
+    return np.bincount(ids, minlength=num_experts).astype(np.float64)
+
+
+def _expert_load_cosine(
+    layer_routes: np.ndarray,
+    next_layer_routes: np.ndarray,
+    num_experts: int,
+) -> float:
+    counts = _expert_load_counts(layer_routes, num_experts)
+    next_counts = _expert_load_counts(next_layer_routes, num_experts)
+    denominator = np.linalg.norm(counts) * np.linalg.norm(next_counts)
+    if denominator == 0:
+        return np.nan
+    return float(np.dot(counts, next_counts) / denominator)
+
+
+def _topk_set_jaccard(
+    layer_routes: np.ndarray,
+    next_layer_routes: np.ndarray,
+    num_experts: int,
+) -> float:
+    num_tokens = min(layer_routes.shape[0], next_layer_routes.shape[0])
+    if num_tokens == 0:
+        return np.nan
+
+    similarities: list[float] = []
+    for token_id in range(num_tokens):
+        current = {
+            int(expert_id)
+            for expert_id in layer_routes[token_id]
+            if 0 <= expert_id < num_experts
+        }
+        following = {
+            int(expert_id)
+            for expert_id in next_layer_routes[token_id]
+            if 0 <= expert_id < num_experts
+        }
+        union = current | following
+        if union:
+            similarities.append(len(current & following) / len(union))
+    if not similarities:
+        return np.nan
+    return float(np.mean(similarities))
+
+
+def _adjacent_route_similarities(
+    samples: list[np.ndarray],
+    metadata: dict[str, Any],
+    num_experts: int,
+    phase: str,
+) -> list[dict[str, float | int]]:
+    prompt_token_counts = metadata["prompt_token_counts"]
+    if not samples:
+        raise ValueError("No route samples found")
+
+    num_layers = min(routes.shape[1] for routes in samples)
+    rows: list[dict[str, float | int]] = []
+    for layer_id in range(num_layers - 1):
+        token_jaccard_values = []
+        load_cosine_values = []
+        for sample_id, routes in enumerate(samples):
+            if routes.ndim != 3:
+                raise ValueError(
+                    "Expected route shape [token, layer, top_k], "
+                    f"got {routes.shape}"
+                )
+            selected_routes = _route_ids_for_phase(
+                routes,
+                int(prompt_token_counts[sample_id]),
+                phase,
+            )
+            if selected_routes.shape[0] == 0:
+                continue
+            layer_routes = selected_routes[:, layer_id, :]
+            next_layer_routes = selected_routes[:, layer_id + 1, :]
+            token_jaccard = _topk_set_jaccard(
+                layer_routes,
+                next_layer_routes,
+                num_experts,
+            )
+            load_cosine = _expert_load_cosine(
+                layer_routes,
+                next_layer_routes,
+                num_experts,
+            )
+            if not np.isnan(token_jaccard):
+                token_jaccard_values.append(token_jaccard)
+            if not np.isnan(load_cosine):
+                load_cosine_values.append(load_cosine)
+
+        rows.append(
+            {
+                "layer_i": layer_id,
+                "layer_j": layer_id + 1,
+                "num_samples": len(token_jaccard_values),
+                "token_jaccard_mean": float(np.mean(token_jaccard_values))
+                if token_jaccard_values
+                else np.nan,
+                "token_jaccard_std": float(np.std(token_jaccard_values))
+                if token_jaccard_values
+                else np.nan,
+                "load_cosine_mean": float(np.mean(load_cosine_values))
+                if load_cosine_values
+                else np.nan,
+                "load_cosine_std": float(np.std(load_cosine_values))
+                if load_cosine_values
+                else np.nan,
+            }
+        )
+    return rows
+
+
 def _categorical_expert_colors(num_experts: int) -> np.ndarray:
     """Generate discrete colors with strong contrast between adjacent IDs."""
     from matplotlib.colors import hsv_to_rgb
@@ -357,6 +490,143 @@ def plot_experts(args: argparse.Namespace) -> None:
     output = args.output or trace_dir / "expert_distribution.png"
     fig.savefig(output, dpi=200, bbox_inches="tight")
     print(f"Saved {output}")
+
+
+def _write_route_similarity_data(
+    output: Path,
+    rows: list[dict[str, float | int]],
+    metadata: dict[str, Any],
+    phase: str,
+) -> None:
+    csv_header = (
+        "layer_i,layer_j,num_samples,token_jaccard_mean,token_jaccard_std,"
+        "load_cosine_mean,load_cosine_std"
+    )
+    csv_rows = []
+    for row in rows:
+        csv_rows.append(
+            ",".join(
+                [
+                    str(row["layer_i"]),
+                    str(row["layer_j"]),
+                    str(row["num_samples"]),
+                    f"{row['token_jaccard_mean']:.6f}",
+                    f"{row['token_jaccard_std']:.6f}",
+                    f"{row['load_cosine_mean']:.6f}",
+                    f"{row['load_cosine_std']:.6f}",
+                ]
+            )
+        )
+    output.with_suffix(".csv").write_text(
+        csv_header + "\n" + "\n".join(csv_rows) + "\n",
+        encoding="utf-8",
+    )
+
+    layer_pairs = np.array(
+        [[row["layer_i"], row["layer_j"]] for row in rows],
+        dtype=np.int64,
+    )
+    np.savez_compressed(
+        output.with_suffix(".npz"),
+        layer_pairs=layer_pairs,
+        token_jaccard_mean=np.array(
+            [row["token_jaccard_mean"] for row in rows],
+            dtype=np.float64,
+        ),
+        token_jaccard_std=np.array(
+            [row["token_jaccard_std"] for row in rows],
+            dtype=np.float64,
+        ),
+        load_cosine_mean=np.array(
+            [row["load_cosine_mean"] for row in rows],
+            dtype=np.float64,
+        ),
+        load_cosine_std=np.array(
+            [row["load_cosine_std"] for row in rows],
+            dtype=np.float64,
+        ),
+    )
+
+    json_payload = {
+        "phase": phase,
+        "metrics": {
+            "token_jaccard": (
+                "Mean per-token Jaccard similarity between the top-k expert "
+                "sets selected by adjacent layers."
+            ),
+            "load_cosine": (
+                "Cosine similarity between adjacent layers' aggregate expert "
+                "assignment count vectors."
+            ),
+        },
+        "model": metadata.get("model"),
+        "num_experts": metadata.get("num_experts"),
+        "rows": rows,
+    }
+    output.with_suffix(".json").write_text(
+        json.dumps(json_payload, indent=2),
+        encoding="utf-8",
+    )
+
+
+def plot_route_similarity(args: argparse.Namespace) -> None:
+    import matplotlib.pyplot as plt
+
+    trace_dir = args.trace_dir.resolve()
+    samples, metadata = _load_route_samples(trace_dir)
+    num_experts = args.num_experts or int(metadata["num_experts"])
+    rows = _adjacent_route_similarities(
+        samples,
+        metadata,
+        num_experts,
+        args.phase,
+    )
+    if not rows:
+        raise ValueError("Need at least two routed MoE layers to compare")
+
+    layer_labels = [f"{row['layer_i']}→{row['layer_j']}" for row in rows]
+    x = np.arange(len(rows))
+    metric_specs = {
+        "token-jaccard": (
+            "token_jaccard_mean",
+            "token_jaccard_std",
+            "Token top-k Jaccard",
+        ),
+        "load-cosine": ("load_cosine_mean", "load_cosine_std", "Expert load cosine"),
+    }
+    selected_metrics = (
+        list(metric_specs)
+        if args.metric == "all"
+        else [args.metric]
+    )
+
+    fig, ax = plt.subplots(figsize=(max(8.0, len(rows) * 0.55), 4.8))
+    for metric in selected_metrics:
+        mean_key, std_key, label = metric_specs[metric]
+        means = np.array([row[mean_key] for row in rows], dtype=np.float64)
+        stds = np.array([row[std_key] for row in rows], dtype=np.float64)
+        ax.plot(x, means, marker="o", linewidth=1.8, label=label)
+        ax.fill_between(
+            x,
+            np.maximum(means - stds, 0.0),
+            np.minimum(means + stds, 1.0),
+            alpha=0.15,
+        )
+
+    ax.set_xticks(x, labels=layer_labels, rotation=90)
+    ax.set_ylim(0.0, 1.02)
+    ax.set_xlabel("Adjacent layer pair")
+    ax.set_ylabel("Similarity")
+    ax.grid(alpha=0.2)
+    ax.legend()
+    title = metadata.get("model", "MoE route similarity")
+    ax.set_title(f"{title}: adjacent routed-expert similarity ({args.phase})")
+    fig.tight_layout()
+
+    output = args.output or trace_dir / f"route_similarity_{args.phase}.png"
+    fig.savefig(output, dpi=220, bbox_inches="tight")
+    _write_route_similarity_data(output, rows, metadata, args.phase)
+    print(f"Saved {output} and matching .csv/.json/.npz data")
 
 
 def _load_activations(
@@ -561,6 +831,20 @@ def parse_args() -> argparse.Namespace:
     )
     expert_parser.add_argument("--output", type=Path)
     expert_parser.set_defaults(func=plot_experts)
+
+    route_similarity_parser = subparsers.add_parser("plot-route-similarity")
+    route_similarity_parser.add_argument("--trace-dir", type=Path, required=True)
+    route_similarity_parser.add_argument("--num-experts", type=int)
+    route_similarity_parser.add_argument(
+        "--phase", choices=("prefill", "decode", "all"), default="all"
+    )
+    route_similarity_parser.add_argument(
+        "--metric",
+        choices=("token-jaccard", "load-cosine", "all"),
+        default="all",
+    )
+    route_similarity_parser.add_argument("--output", type=Path)
+    route_similarity_parser.set_defaults(func=plot_route_similarity)
 
     activation_parser = subparsers.add_parser("plot-activations")
     activation_parser.add_argument("--trace-dir", type=Path, required=True)
