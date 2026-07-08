@@ -112,7 +112,7 @@ def _collect_dp_rank(
         enforce_eager=True,
         enable_return_routed_experts=True,
         moe_backend=args.moe_backend,
-        load_format="dummy",
+        load_format=args.load_format,
     )
     sampling_params = SamplingParams(
         temperature=0,
@@ -1139,6 +1139,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Also save, for each layer i, the top-k experts predicted by "
             "feeding layer i's traced router input to layer i+1's gate/router."
+        ),
+    )
+    collect_parser.add_argument(
+        "--load-format",
+        default="auto",
+        help=(
+            "Model weight load format passed to vLLM. Use 'dummy' only for "
+            "plumbing tests; dummy weights make route-overlap plots meaningless."
         ),
     )
     collect_parser.add_argument(
