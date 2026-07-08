@@ -113,11 +113,13 @@ class MoETraceCollector:
         ]
         | None = None,
         next_gate_missing_gate_layers: list[tuple[int, int]] | None = None,
+        next_gate_diagnostics: list[dict[str, Any]] | None = None,
     ) -> None:
         self.config = config
         self.layer_names = layer_names
         self.next_gate_predictors = next_gate_predictors or {}
         self.next_gate_missing_gate_layers = next_gate_missing_gate_layers or []
+        self.next_gate_diagnostics = next_gate_diagnostics or []
         self.rank = _distributed_rank()
         self.rank_dir = config.output_dir / f"rank_{self.rank:05d}"
         self.rank_dir.mkdir(parents=True, exist_ok=True)
@@ -148,6 +150,7 @@ class MoETraceCollector:
                 )
             ],
             "next_gate_missing_gate_layers": self.next_gate_missing_gate_layers,
+            "next_gate_diagnostics": self.next_gate_diagnostics,
             "layers": self.layer_names,
             "notes": (
                 "Each record contains logical expert IDs before EPLB mapping and "
@@ -342,42 +345,48 @@ def maybe_attach_moe_trace(
         )
         return None
 
+    model_modules = dict(model.named_modules()) if model is not None else {}
+
     def _get_module_by_name(name: str) -> torch.nn.Module | None:
         if model is None:
             return None
         if name == "":
             return model
-        module = model
-        for part in name.split("."):
-            if part.isdigit():
-                try:
-                    module = module[int(part)]  # type: ignore[index]
-                except (IndexError, TypeError):
-                    return None
-            elif hasattr(module, part):
-                module = getattr(module, part)
-            else:
-                return None
-        return module
+        if name in model_modules:
+            return model_modules[name]
+        if name.startswith("model."):
+            stripped_name = name.removeprefix("model.")
+            if stripped_name in model_modules:
+                return model_modules[stripped_name]
+
+        suffix_matches = [
+            module
+            for module_name, module in model_modules.items()
+            if module_name.endswith(f".{name}") or name.endswith(f".{module_name}")
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        return None
 
     def _find_next_gate(
         next_name: str,
         next_module: FusedMoE,
-    ) -> torch.nn.Module | None:
+    ) -> tuple[torch.nn.Module | None, str]:
         gate = getattr(next_module.runner, "gate", None)
         if gate is not None:
-            return gate
+            return gate, "runner.gate"
         if next_name.endswith(".experts"):
             parent_name = next_name.removesuffix(".experts")
             parent = _get_module_by_name(parent_name)
             gate = getattr(parent, "gate", None) if parent is not None else None
             if gate is not None:
-                return gate
-        return None
+                return gate, f"{parent_name}.gate"
+        return None, ""
 
     layer_names = {module.layer_id: name for name, module in layers}
     next_gate_predictors = {}
     next_gate_missing_gate_layers = []
+    next_gate_diagnostics = []
     if config.trace_next_gate:
         import torch.nn.functional as F
 
@@ -387,7 +396,17 @@ def maybe_attach_moe_trace(
             sorted_layers[1:],
         ):
             runner = next_module.runner
-            gate = _find_next_gate(next_name, next_module)
+            runner_gate = getattr(runner, "gate", None)
+            gate, gate_source = _find_next_gate(next_name, next_module)
+            diagnostic = {
+                "layer_id": module.layer_id,
+                "next_layer_id": next_module.layer_id,
+                "next_layer_name": next_name,
+                "runner_gate": runner_gate is not None,
+                "gate_found": gate is not None,
+                "gate_source": gate_source,
+            }
+            next_gate_diagnostics.append(diagnostic)
             if gate is None:
                 next_gate_missing_gate_layers.append(
                     (module.layer_id, next_module.layer_id)
@@ -441,6 +460,7 @@ def maybe_attach_moe_trace(
         layer_names,
         next_gate_predictors,
         next_gate_missing_gate_layers,
+        next_gate_diagnostics,
     )
     for _, module in layers:
         layer_id = module.layer_id
