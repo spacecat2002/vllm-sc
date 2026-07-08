@@ -721,6 +721,9 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "received_tokens_imbalance": max(received) / mean_received
                 if mean_received
                 else 0.0,
+                "token_imbalance": max(received) / mean_received
+                if mean_received
+                else 0.0,
                 "mean_remote_assignment_share": statistics.mean(remote_shares),
                 "target_assignment_imbalance": target_metrics["imbalance"],
                 "target_assignment_max_share": target_metrics["max_share"],
@@ -769,6 +772,9 @@ def make_sweep_summary_row(
         "mean_compute_imbalance": statistics.mean(
             r["compute_imbalance"] for r in summary_aggregates
         ),
+        "mean_token_imbalance": statistics.mean(
+            r["token_imbalance"] for r in summary_aggregates
+        ),
         "mean_remote_share": statistics.mean(
             r["mean_remote_assignment_share"] for r in summary_aggregates
         ),
@@ -795,8 +801,8 @@ def print_sweep_summary(rows: list[dict[str, Any]]) -> None:
     print("sweep summary")
     print(
         "hot_share iters trimmed mean_total mean_dispatch mean_compute "
-        "mean_combine compute_imbalance remote_share target_imbalance "
-        "dispatch_mib a2a_mib max_recv_mib"
+        "mean_combine time_imbalance token_imbalance remote_share "
+        "target_imbalance dispatch_mib a2a_mib max_recv_mib"
     )
     for row in rows:
         print(
@@ -808,6 +814,7 @@ def print_sweep_summary(rows: list[dict[str, Any]]) -> None:
             f"{row['mean_max_compute_ms']:>12.3f} "
             f"{row['mean_max_combine_ms']:>12.3f} "
             f"{row['mean_compute_imbalance']:>17.3f} "
+            f"{row['mean_token_imbalance']:>16.3f} "
             f"{row['mean_remote_share']:>12.3f} "
             f"{row['mean_target_imbalance']:>16.3f} "
             f"{row['mean_dispatch_mib']:>12.3f} "
@@ -822,7 +829,7 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
     summary_aggregates = trim_aggregates(aggregates, args.trim_ratio)
     print(
         "iter max_total max_dispatch max_compute max_combine "
-        "compute_imbalance recv_min recv_max recv_imbalance "
+        "time_imbalance token_imbalance recv_min recv_max recv_imbalance "
         "remote_share target_imbalance dispatch_mib a2a_mib max_recv_mib"
     )
     for record in aggregates:
@@ -833,6 +840,7 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
             f"{record['max_expert_compute_ms']:>11.3f} "
             f"{record['max_combine_ms']:>11.3f} "
             f"{record['compute_imbalance']:>17.3f} "
+            f"{record['token_imbalance']:>16.3f} "
             f"{record['received_tokens_min']:>8} "
             f"{record['received_tokens_max']:>8} "
             f"{record['received_tokens_imbalance']:>14.3f} "
@@ -858,7 +866,9 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
         "mean(max_combine_ms)="
         f"{statistics.mean(r['max_combine_ms'] for r in summary_aggregates):.3f}, "
         "mean(compute_imbalance)="
-        f"{statistics.mean(r['compute_imbalance'] for r in summary_aggregates):.3f}"
+        f"{statistics.mean(r['compute_imbalance'] for r in summary_aggregates):.3f}, "
+        "mean(token_imbalance)="
+        f"{statistics.mean(r['token_imbalance'] for r in summary_aggregates):.3f}"
     )
 
 
