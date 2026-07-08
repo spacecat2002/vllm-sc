@@ -96,6 +96,7 @@ def _collect_dp_rank(
     os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
     # Request-level routed-expert capture is not supported by Model Runner V2.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    os.environ["VLLM_MOE_TRACE_NEXT_GATE"] = "1" if args.trace_next_gate else "0"
 
     from vllm import LLM, SamplingParams
 
@@ -111,6 +112,7 @@ def _collect_dp_rank(
         enforce_eager=True,
         enable_return_routed_experts=True,
         moe_backend=args.moe_backend,
+        load_format="dummy",
     )
     sampling_params = SamplingParams(
         temperature=0,
@@ -136,6 +138,8 @@ def _collect_dp_rank(
         "num_experts": _num_experts(llm.model_config.hf_text_config),
         "prompt_token_counts": prompt_token_counts,
         "generated_texts": generated_texts,
+        "trace_next_gate_arg": args.trace_next_gate,
+        "trace_next_gate_env": os.environ.get("VLLM_MOE_TRACE_NEXT_GATE"),
     }
     (shard_dir / f"rank_{global_dp_rank:05d}.json").write_text(
         json.dumps(shard_metadata), encoding="utf-8"
@@ -185,6 +189,55 @@ def _merge_route_shards(
     ranks = [sample_dp_ranks[key] for key in expected_keys]
     texts = [generated_texts[key] for key in expected_keys]
     return num_experts, counts, ranks, texts
+
+
+def _check_next_gate_trace(output_dir: Path) -> None:
+    import torch
+
+    activation_dir = output_dir / "activations"
+    rank_metadata_paths = sorted(activation_dir.glob("rank_*/metadata.json"))
+    if not rank_metadata_paths:
+        raise RuntimeError(f"No rank metadata found under {activation_dir}")
+
+    has_predictor = False
+    for metadata_path in rank_metadata_paths:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        predictor_count = int(metadata.get("next_gate_predictor_count", 0))
+        trace_next_gate = bool(metadata.get("trace_next_gate", False))
+        print(
+            f"{metadata_path.parent.name}: trace_next_gate={trace_next_gate}, "
+            f"next_gate_predictor_count={predictor_count}"
+        )
+        if predictor_count > 0:
+            has_predictor = True
+        elif trace_next_gate:
+            diagnostics = metadata.get("next_gate_diagnostics", [])
+            print(
+                f"{metadata_path.parent.name}: next_gate_diagnostics sample="
+                f"{diagnostics[:3]}"
+            )
+
+    if not has_predictor:
+        raise RuntimeError(
+            "--trace-next-gate was set, but no rank built any next-gate "
+            "predictor. Check activations/rank_*/metadata.json for "
+            "next_gate_diagnostics."
+        )
+
+    record_paths = sorted(activation_dir.glob("rank_*/step_*_layer_*.pt"))
+    if not record_paths:
+        raise RuntimeError(f"No .pt activation records found under {activation_dir}")
+
+    for record_path in record_paths[: min(len(record_paths), 32)]:
+        record = torch.load(record_path, map_location="cpu", weights_only=True)
+        if "next_gate_predicted_topk_ids" in record:
+            return
+
+    raise RuntimeError(
+        "Next-gate predictors were built, but the sampled .pt records do not "
+        "contain next_gate_predicted_topk_ids. Check whether only final-layer "
+        "records were sampled or inspect all activation records."
+    )
 
 
 def collect(args: argparse.Namespace) -> None:
@@ -299,12 +352,14 @@ def collect(args: argparse.Namespace) -> None:
         json.dumps(generations, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    for item in generations:
-        print(
-            f"\n[sample {item['sample_id']:06d} | dp_rank {item['dp_rank']}]\n"
-            f"Prompt:\n{item['prompt']}\n"
-            f"Generated:\n{item['generated_text']}"
-        )
+    # for item in generations:
+    #     print(
+    #         f"\n[sample {item['sample_id']:06d} | dp_rank {item['dp_rank']}]\n"
+    #         f"Prompt:\n{item['prompt']}\n"
+    #         f"Generated:\n{item['generated_text']}"
+    #     )
+    if args.trace_next_gate:
+        _check_next_gate_trace(output_dir)
     print(f"Saved routes and activations under {output_dir}")
 
 

@@ -10,6 +10,7 @@ intended for short, eager-mode research runs only.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -43,6 +44,17 @@ def _distributed_rank() -> int:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank()
     return 0
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    if raw in ("0", "false", "False"):
+        return False
+    if raw in ("1", "true", "True"):
+        return True
+    raise ValueError(f"{name} must be one of 0/1/false/true, got {raw!r}")
 
 
 @dataclass(frozen=True)
@@ -97,7 +109,7 @@ class MoETraceConfig:
             activations=activations,  # type: ignore[arg-type]
             activation_dtype=dtypes[dtype_name],
             token_selection=token_selection,  # type: ignore[arg-type]
-            trace_next_gate=envs.VLLM_MOE_TRACE_NEXT_GATE,
+            trace_next_gate=_bool_env(_NEXT_GATE_ENV),
         )
 
 
@@ -142,6 +154,7 @@ class MoETraceCollector:
             ),
             "token_selection": self.config.token_selection,
             "trace_next_gate": self.config.trace_next_gate,
+            "trace_next_gate_env": os.getenv(_NEXT_GATE_ENV),
             "next_gate_predictor_count": len(self.next_gate_predictors),
             "next_gate_predictor_pairs": [
                 [layer_id, next_layer_id]
@@ -461,7 +474,21 @@ def maybe_attach_moe_trace(
     next_gate_predictors = {}
     next_gate_missing_gate_layers = []
     next_gate_diagnostics = []
+    logger.warning(
+        "%s raw value on rank %d is %r; parsed trace_next_gate=%s",
+        _NEXT_GATE_ENV,
+        _distributed_rank(),
+        os.getenv(_NEXT_GATE_ENV),
+        config.trace_next_gate,
+    )
     if config.trace_next_gate:
+        logger.warning(
+            "%s enabled on rank %d; building next-gate predictors for %d "
+            "traceable MoE layers",
+            _NEXT_GATE_ENV,
+            _distributed_rank(),
+            len(layers),
+        )
         sorted_layers = sorted(layers, key=lambda item: item[1].layer_id)
         for (_, module), (next_name, next_module) in zip(
             sorted_layers,
@@ -485,10 +512,30 @@ def maybe_attach_moe_trace(
             }
             next_gate_diagnostics.append(diagnostic)
             if gate_projector is None:
+                logger.warning(
+                    "%s could not find gate for layer %d -> %d; "
+                    "next_layer_name=%s candidates=%s runner_gate=%s",
+                    _NEXT_GATE_ENV,
+                    module.layer_id,
+                    next_module.layer_id,
+                    next_name,
+                    diagnostic["gate_candidates"],
+                    diagnostic["runner_gate"],
+                )
                 next_gate_missing_gate_layers.append(
                     (module.layer_id, next_module.layer_id)
                 )
                 continue
+            logger.warning(
+                "%s using gate for layer %d -> %d from %s; "
+                "next_layer_name=%s runner_gate=%s",
+                _NEXT_GATE_ENV,
+                module.layer_id,
+                next_module.layer_id,
+                gate_source,
+                next_name,
+                diagnostic["runner_gate"],
+            )
 
             @torch.no_grad()
             def _predict_next_topk(
