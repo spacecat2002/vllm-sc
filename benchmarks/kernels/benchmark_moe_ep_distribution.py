@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
             "Currently supports Qwen3-30B-A3B routed experts."
         ),
     )
-    parser.add_argument("--tokens", type=int, default=1024)
+    parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--intermediate-size", type=int, default=14336)
     parser.add_argument("--num-experts", type=int, default=8)
