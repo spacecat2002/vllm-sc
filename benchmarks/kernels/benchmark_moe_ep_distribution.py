@@ -48,16 +48,34 @@ from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.worker.workspace import init_workspace_manager
 
 
+MODEL_PRESETS = {
+    "qwen3-30b-a3b": {
+        "hidden_size": 2048,
+        "intermediate_size": 768,
+        "num_experts": 128,
+        "top_k": 8,
+        "dtype": "bfloat16",
+    },
+    "qwen3-235b-a22b": {
+        "hidden_size": 4096,
+        "intermediate_size": 1536,
+        "num_experts": 128,
+        "top_k": 8,
+        "dtype": "bfloat16",
+    },
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Isolated MoE EP distribution benchmark."
     )
     parser.add_argument(
         "--model-preset",
-        choices=("qwen3-30b-a3b",),
+        choices=tuple(MODEL_PRESETS),
         help=(
             "Fill expert-related shape arguments from a known model preset. "
-            "Currently supports Qwen3-30B-A3B routed experts."
+            "Currently supports Qwen3 MoE routed expert presets."
         ),
     )
     parser.add_argument("--tokens", type=int, default=4096)
@@ -158,12 +176,9 @@ def parse_args() -> argparse.Namespace:
         help="Rendezvous port for internal multi-process launch.",
     )
     args = parser.parse_args()
-    if args.model_preset == "qwen3-30b-a3b":
-        args.hidden_size = 2048
-        args.intermediate_size = 768
-        args.num_experts = 128
-        args.top_k = 8
-        args.dtype = "bfloat16"
+    if args.model_preset is not None:
+        for name, value in MODEL_PRESETS[args.model_preset].items():
+            setattr(args, name, value)
     return args
 
 
