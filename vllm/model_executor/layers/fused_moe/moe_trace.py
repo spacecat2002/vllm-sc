@@ -112,10 +112,12 @@ class MoETraceCollector:
             int, tuple[int, Callable[[torch.Tensor], torch.Tensor]]
         ]
         | None = None,
+        next_gate_missing_gate_layers: list[tuple[int, int]] | None = None,
     ) -> None:
         self.config = config
         self.layer_names = layer_names
         self.next_gate_predictors = next_gate_predictors or {}
+        self.next_gate_missing_gate_layers = next_gate_missing_gate_layers or []
         self.rank = _distributed_rank()
         self.rank_dir = config.output_dir / f"rank_{self.rank:05d}"
         self.rank_dir.mkdir(parents=True, exist_ok=True)
@@ -138,6 +140,14 @@ class MoETraceCollector:
             ),
             "token_selection": self.config.token_selection,
             "trace_next_gate": self.config.trace_next_gate,
+            "next_gate_predictor_count": len(self.next_gate_predictors),
+            "next_gate_predictor_pairs": [
+                [layer_id, next_layer_id]
+                for layer_id, (next_layer_id, _) in sorted(
+                    self.next_gate_predictors.items()
+                )
+            ],
+            "next_gate_missing_gate_layers": self.next_gate_missing_gate_layers,
             "layers": self.layer_names,
             "notes": (
                 "Each record contains logical expert IDs before EPLB mapping and "
@@ -333,6 +343,7 @@ def maybe_attach_moe_trace(
 
     layer_names = {module.layer_id: name for name, module in layers}
     next_gate_predictors = {}
+    next_gate_missing_gate_layers = []
     if config.trace_next_gate:
         import torch.nn.functional as F
 
@@ -343,6 +354,9 @@ def maybe_attach_moe_trace(
             runner = next_module.runner
             gate = getattr(runner, "gate", None)
             if gate is None:
+                next_gate_missing_gate_layers.append(
+                    (module.layer_id, next_module.layer_id)
+                )
                 continue
 
             @torch.no_grad()
@@ -378,8 +392,21 @@ def maybe_attach_moe_trace(
                 "%s was set, but no next-layer gate predictors could be built",
                 _NEXT_GATE_ENV,
             )
+        elif next_gate_missing_gate_layers:
+            logger.warning(
+                "%s built %d next-layer gate predictors, but skipped %d layer "
+                "pairs whose next layer has no runner.gate",
+                _NEXT_GATE_ENV,
+                len(next_gate_predictors),
+                len(next_gate_missing_gate_layers),
+            )
 
-    collector = MoETraceCollector(config, layer_names, next_gate_predictors)
+    collector = MoETraceCollector(
+        config,
+        layer_names,
+        next_gate_predictors,
+        next_gate_missing_gate_layers,
+    )
     for _, module in layers:
         layer_id = module.layer_id
 
