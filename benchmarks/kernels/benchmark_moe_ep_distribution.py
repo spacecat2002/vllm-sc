@@ -107,8 +107,24 @@ def parse_args() -> argparse.Namespace:
             "and 1.0 for concentrated-like routing."
         ),
     )
+    parser.add_argument(
+        "--hot-shares",
+        help=(
+            "Comma-separated hot-share values to sweep in one distributed "
+            "initialization, e.g. '0,0.25,0.5,0.75,1'. Overrides --hot-share."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--trim-ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "Fraction of iterations to drop from each tail when computing "
+            "summary means. Rows are trimmed by max_total_ms."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--stage-barrier",
@@ -165,6 +181,31 @@ def dtype_nbytes(dtype: torch.dtype) -> int:
 
 def bytes_to_mib(num_bytes: int | float) -> float:
     return float(num_bytes) / (1024 * 1024)
+
+
+def parse_hot_share_values(args: argparse.Namespace) -> list[float]:
+    if args.hot_shares is None:
+        return [args.hot_share]
+    values = []
+    for raw_value in args.hot_shares.split(","):
+        value = raw_value.strip()
+        if value:
+            values.append(float(value))
+    if not values:
+        raise ValueError("--hot-shares must contain at least one value.")
+    return values
+
+
+def trim_aggregates(
+    aggregates: list[dict[str, Any]],
+    trim_ratio: float,
+) -> list[dict[str, Any]]:
+    trim_count = int(len(aggregates) * trim_ratio)
+    if trim_count == 0 or trim_count * 2 >= len(aggregates):
+        return aggregates
+    sorted_by_total = sorted(aggregates, key=lambda record: record["max_total_ms"])
+    kept = sorted_by_total[trim_count:-trim_count]
+    return sorted(kept, key=lambda record: record["iter"])
 
 
 def sync(device: torch.device) -> None:
@@ -587,6 +628,7 @@ def run_one_iter(
         "record_type": "rank",
         "pattern": args.pattern,
         "backend": args.backend,
+        "hot_share": args.hot_share,
         "stage_barrier": args.stage_barrier,
         "iter": iteration,
         "rank": rank,
@@ -647,6 +689,7 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "record_type": "aggregate",
                 "iter": iteration,
+                "hot_share": iter_records[0]["hot_share"],
                 "max_dispatch_ms": max(dispatch),
                 "mean_dispatch_ms": statistics.mean(dispatch),
                 "max_expert_compute_ms": max(compute),
@@ -690,6 +733,7 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) -> None:
     if not aggregates:
         return
+    summary_aggregates = trim_aggregates(aggregates, args.trim_ratio)
     print(
         "iter max_total max_dispatch max_compute max_combine "
         "compute_imbalance recv_min recv_max recv_imbalance "
@@ -716,17 +760,19 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
     print()
     print(
         f"pattern={args.pattern} backend={args.backend} "
-        f"iters={len(aggregates)}"
+        f"hot_share={aggregates[0]['hot_share']} "
+        f"iters={len(aggregates)} trimmed_iters={len(summary_aggregates)} "
+        f"trim_ratio={args.trim_ratio}"
     )
     print(
         "mean(max_dispatch_ms)="
-        f"{statistics.mean(r['max_dispatch_ms'] for r in aggregates):.3f}, "
+        f"{statistics.mean(r['max_dispatch_ms'] for r in summary_aggregates):.3f}, "
         "mean(max_compute_ms)="
-        f"{statistics.mean(r['max_expert_compute_ms'] for r in aggregates):.3f}, "
+        f"{statistics.mean(r['max_expert_compute_ms'] for r in summary_aggregates):.3f}, "
         "mean(max_combine_ms)="
-        f"{statistics.mean(r['max_combine_ms'] for r in aggregates):.3f}, "
+        f"{statistics.mean(r['max_combine_ms'] for r in summary_aggregates):.3f}, "
         "mean(compute_imbalance)="
-        f"{statistics.mean(r['compute_imbalance'] for r in aggregates):.3f}"
+        f"{statistics.mean(r['compute_imbalance'] for r in summary_aggregates):.3f}"
     )
 
 
@@ -778,13 +824,14 @@ def _run_worker(
         init_workspace_manager(device)
 
         kernel = make_kernel(args, vllm_config, dtype, device)
-        tensors = make_inputs(args, rank, world_size, dtype, device)
         num_tokens_across_dp = torch.full(
             (world_size,),
             args.tokens,
             device=device,
             dtype=torch.int,
         )
+        hot_share_values = args.hot_share_values
+        output_records: list[dict[str, Any]] = []
 
         with set_forward_context(
             None,
@@ -792,7 +839,9 @@ def _run_worker(
             num_tokens=args.tokens,
             num_tokens_across_dp=num_tokens_across_dp,
         ):
-            def run_iterations() -> list[dict[str, Any]]:
+            def run_iterations(
+                tensors: dict[str, torch.Tensor],
+            ) -> list[dict[str, Any]]:
                 for _ in range(args.warmup):
                     run_one_iter(
                         args,
@@ -822,25 +871,33 @@ def _run_worker(
                 return records
 
             ctx = get_forward_context()
-            if ctx.dp_metadata is None:
-                local_records = run_iterations()
-            else:
-                with ctx.dp_metadata.sp_local_sizes(sequence_parallel_size=1):
-                    local_records = run_iterations()
 
-        gathered: list[Any] | None = (
-            [None for _ in range(world_size)] if rank == 0 else None
-        )
-        dist.gather_object(local_records, gathered, dst=0)
+            for hot_share in hot_share_values:
+                args.hot_share = hot_share
+                tensors = make_inputs(args, rank, world_size, dtype, device)
+                if ctx.dp_metadata is None:
+                    local_records = run_iterations(tensors)
+                else:
+                    with ctx.dp_metadata.sp_local_sizes(sequence_parallel_size=1):
+                        local_records = run_iterations(tensors)
 
-        if rank == 0:
-            assert gathered is not None
-            records = [record for rank_records in gathered for record in rank_records]
-            aggregates = aggregate_records(records)
-            if args.output_jsonl is not None:
-                write_jsonl(args.output_jsonl, records + aggregates)
-                print(f"Wrote JSONL: {args.output_jsonl}")
-            print_summary(args, aggregates)
+                gathered: list[Any] | None = (
+                    [None for _ in range(world_size)] if rank == 0 else None
+                )
+                dist.gather_object(local_records, gathered, dst=0)
+
+                if rank == 0:
+                    assert gathered is not None
+                    records = [
+                        record for rank_records in gathered for record in rank_records
+                    ]
+                    aggregates = aggregate_records(records)
+                    output_records.extend(records + aggregates)
+                    print_summary(args, aggregates)
+
+        if rank == 0 and args.output_jsonl is not None:
+            write_jsonl(args.output_jsonl, output_records)
+            print(f"Wrote JSONL: {args.output_jsonl}")
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -878,9 +935,13 @@ def _launched_with_torchrun() -> bool:
 
 def main() -> None:
     args = parse_args()
+    args.hot_share_values = parse_hot_share_values(args)
 
-    if not 0.0 <= args.hot_share <= 1.0:
-        raise ValueError("--hot-share must be between 0.0 and 1.0.")
+    for hot_share in args.hot_share_values:
+        if not 0.0 <= hot_share <= 1.0:
+            raise ValueError("--hot-share values must be between 0.0 and 1.0.")
+    if not 0.0 <= args.trim_ratio < 0.5:
+        raise ValueError("--trim-ratio must be in [0.0, 0.5).")
 
     if _launched_with_torchrun():
         try:
