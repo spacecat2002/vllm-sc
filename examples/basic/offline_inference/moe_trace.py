@@ -120,18 +120,22 @@ def _collect_dp_rank(
     request_outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
     routes: dict[str, np.ndarray] = {}
     prompt_token_counts: dict[str, int] = {}
+    generated_texts: dict[str, str] = {}
     for (sample_id, _), request_output in zip(indexed_prompts, request_outputs):
-        routed_experts = request_output.outputs[0].routed_experts
+        completion_output = request_output.outputs[0]
+        routed_experts = completion_output.routed_experts
         if routed_experts is None:
             raise RuntimeError("vLLM did not return routed experts")
         sample_key = f"sample_{sample_id:06d}"
         routes[sample_key] = routed_experts
         prompt_token_counts[sample_key] = len(request_output.prompt_token_ids)
+        generated_texts[sample_key] = completion_output.text
 
     np.savez_compressed(shard_dir / f"rank_{global_dp_rank:05d}.npz", **routes)
     shard_metadata = {
         "num_experts": _num_experts(llm.model_config.hf_text_config),
         "prompt_token_counts": prompt_token_counts,
+        "generated_texts": generated_texts,
     }
     (shard_dir / f"rank_{global_dp_rank:05d}.json").write_text(
         json.dumps(shard_metadata), encoding="utf-8"
@@ -147,9 +151,10 @@ def _merge_route_shards(
     output_dir: Path,
     shard_dir: Path,
     num_samples: int,
-) -> tuple[int, list[int], list[int]]:
+) -> tuple[int, list[int], list[int], list[str]]:
     routes: dict[str, np.ndarray] = {}
     prompt_token_counts: dict[str, int] = {}
+    generated_texts: dict[str, str] = {}
     sample_dp_ranks: dict[str, int] = {}
     num_experts: int | None = None
     for route_path in sorted(shard_dir.glob("rank_*.npz")):
@@ -163,6 +168,7 @@ def _merge_route_shards(
             raise ValueError("DP ranks reported different numbers of experts")
         num_experts = shard_num_experts
         prompt_token_counts.update(shard_metadata["prompt_token_counts"])
+        generated_texts.update(shard_metadata["generated_texts"])
 
     expected_keys = [f"sample_{sample_id:06d}" for sample_id in range(num_samples)]
     if sorted(routes) != expected_keys:
@@ -177,7 +183,8 @@ def _merge_route_shards(
     )
     counts = [int(prompt_token_counts[key]) for key in expected_keys]
     ranks = [sample_dp_ranks[key] for key in expected_keys]
-    return num_experts, counts, ranks
+    texts = [generated_texts[key] for key in expected_keys]
+    return num_experts, counts, ranks, texts
 
 
 def collect(args: argparse.Namespace) -> None:
@@ -250,7 +257,12 @@ def collect(args: argparse.Namespace) -> None:
                 f"DP process {process.pid} exited with code {process.exitcode}"
             )
 
-    num_experts, prompt_token_counts, sample_dp_ranks = _merge_route_shards(
+    (
+        num_experts,
+        prompt_token_counts,
+        sample_dp_ranks,
+        generated_texts,
+    ) = _merge_route_shards(
         output_dir,
         shard_dir,
         len(prompts),
@@ -274,6 +286,25 @@ def collect(args: argparse.Namespace) -> None:
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
     )
+    generations = [
+        {
+            "sample_id": sample_id,
+            "dp_rank": sample_dp_ranks[sample_id],
+            "prompt": prompt,
+            "generated_text": generated_texts[sample_id],
+        }
+        for sample_id, prompt in enumerate(prompts)
+    ]
+    (output_dir / "generations.json").write_text(
+        json.dumps(generations, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    for item in generations:
+        print(
+            f"\n[sample {item['sample_id']:06d} | dp_rank {item['dp_rank']}]\n"
+            f"Prompt:\n{item['prompt']}\n"
+            f"Generated:\n{item['generated_text']}"
+        )
     print(f"Saved routes and activations under {output_dir}")
 
 
