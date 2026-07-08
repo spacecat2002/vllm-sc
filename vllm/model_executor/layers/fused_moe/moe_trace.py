@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import torch
 
@@ -27,6 +27,7 @@ _MAX_TOKENS_ENV = "VLLM_MOE_TRACE_MAX_TOKENS"
 _ACTIVATIONS_ENV = "VLLM_MOE_TRACE_ACTIVATIONS"
 _ACTIVATION_DTYPE_ENV = "VLLM_MOE_TRACE_ACTIVATION_DTYPE"
 _TOKEN_SELECTION_ENV = "VLLM_MOE_TRACE_TOKEN_SELECTION"
+_NEXT_GATE_ENV = "VLLM_MOE_TRACE_NEXT_GATE"
 
 ActivationMode = Literal["none", "input"]
 TokenSelection = Literal["all", "prefill_last"]
@@ -52,6 +53,7 @@ class MoETraceConfig:
     activations: ActivationMode
     activation_dtype: torch.dtype
     token_selection: TokenSelection = "all"
+    trace_next_gate: bool = False
 
     @classmethod
     def from_env(cls) -> MoETraceConfig | None:
@@ -95,6 +97,7 @@ class MoETraceConfig:
             activations=activations,  # type: ignore[arg-type]
             activation_dtype=dtypes[dtype_name],
             token_selection=token_selection,  # type: ignore[arg-type]
+            trace_next_gate=envs.VLLM_MOE_TRACE_NEXT_GATE,
         )
 
 
@@ -105,9 +108,14 @@ class MoETraceCollector:
         self,
         config: MoETraceConfig,
         layer_names: dict[int, str],
+        next_gate_predictors: dict[
+            int, tuple[int, Callable[[torch.Tensor], torch.Tensor]]
+        ]
+        | None = None,
     ) -> None:
         self.config = config
         self.layer_names = layer_names
+        self.next_gate_predictors = next_gate_predictors or {}
         self.rank = _distributed_rank()
         self.rank_dir = config.output_dir / f"rank_{self.rank:05d}"
         self.rank_dir.mkdir(parents=True, exist_ok=True)
@@ -129,11 +137,14 @@ class MoETraceCollector:
                 "torch."
             ),
             "token_selection": self.config.token_selection,
+            "trace_next_gate": self.config.trace_next_gate,
             "layers": self.layer_names,
             "notes": (
                 "Each record contains logical expert IDs before EPLB mapping and "
-                "the input to that MoE router. A step is one observed forward or "
-                "microbatch on this worker."
+                "the input to that MoE router. If trace_next_gate is enabled, "
+                "a record for layer i also contains the top-k experts predicted "
+                "by feeding layer i's selected router input to layer i+1's gate. "
+                "A step is one observed forward or microbatch on this worker."
             ),
         }
         path = self.rank_dir / "metadata.json"
@@ -252,6 +263,7 @@ class MoETraceCollector:
             device=hidden_states.device,
         )
 
+        selected_hidden_states = hidden_states.index_select(0, index_tensor)
         record: dict[str, Any] = {
             "format_version": 1,
             "rank": self.rank,
@@ -272,8 +284,15 @@ class MoETraceCollector:
             ),
         }
         if self.config.activations == "input":
-            record["activations"] = hidden_states.index_select(0, index_tensor).to(
+            record["activations"] = selected_hidden_states.to(
                 device="cpu", dtype=self.config.activation_dtype
+            )
+        if self.config.trace_next_gate and layer_id in self.next_gate_predictors:
+            next_layer_id, predict_next_gate = self.next_gate_predictors[layer_id]
+            predicted_topk_ids = predict_next_gate(selected_hidden_states)
+            record["next_gate_layer_id"] = next_layer_id
+            record["next_gate_predicted_topk_ids"] = predicted_topk_ids.to(
+                device="cpu", dtype=torch.int32
             )
 
         path = self.rank_dir / (
@@ -313,7 +332,54 @@ def maybe_attach_moe_trace(
         return None
 
     layer_names = {module.layer_id: name for name, module in layers}
-    collector = MoETraceCollector(config, layer_names)
+    next_gate_predictors = {}
+    if config.trace_next_gate:
+        import torch.nn.functional as F
+
+        for (_, module), (_, next_module) in zip(
+            sorted(layers, key=lambda item: item[1].layer_id),
+            sorted(layers, key=lambda item: item[1].layer_id)[1:],
+        ):
+            runner = next_module.runner
+            gate = getattr(runner, "gate", None)
+            if gate is None:
+                continue
+
+            @torch.no_grad()
+            def _predict_next_topk(
+                hidden_states,
+                _next_module=next_module,
+                _runner=runner,
+                _gate=gate,
+            ):
+                if getattr(_runner, "_fse_fuse_gate", False):
+                    _runner._maybe_fuse_gate_weights()
+                    router_logits = F.linear(
+                        hidden_states, _runner._combined_gate_weight
+                    )
+                else:
+                    router_logits, _ = _gate(hidden_states)
+                router = _next_module.router
+                _, topk_ids = router._compute_routing(
+                    hidden_states,
+                    router_logits,
+                    router._get_indices_type(),
+                    input_ids=None,
+                )
+                return topk_ids
+
+            next_gate_predictors[module.layer_id] = (
+                next_module.layer_id,
+                _predict_next_topk,
+            )
+
+        if not next_gate_predictors:
+            logger.warning(
+                "%s was set, but no next-layer gate predictors could be built",
+                _NEXT_GATE_ENV,
+            )
+
+    collector = MoETraceCollector(config, layer_names, next_gate_predictors)
     for _, module in layers:
         layer_id = module.layer_id
 

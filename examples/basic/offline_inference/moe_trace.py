@@ -7,7 +7,7 @@ Examples::
     # Prompts are submitted together; the trace keeps request boundaries.
     .venv/bin/python examples/basic/offline_inference/moe_trace.py collect \
         --model Qwen/Qwen3-30B-A3B --prompts prompts.txt \
-        --output-dir /tmp/qwen3_moe_trace --ep-size 4
+        --output-dir /tmp/qwen3_moe_trace --ep-size 4 --trace-next-gate
 
     .venv/bin/python examples/basic/offline_inference/moe_trace.py \
         plot-experts --trace-dir /tmp/qwen3_moe_trace --layers 8 31
@@ -18,6 +18,9 @@ Examples::
 
     .venv/bin/python examples/basic/offline_inference/moe_trace.py \
         plot-route-similarity --trace-dir /tmp/qwen3_moe_trace --phase prefill
+
+    .venv/bin/python examples/basic/offline_inference/moe_trace.py \
+        plot-next-gate-similarity --trace-dir /tmp/qwen3_moe_trace
 
 ``collect`` intentionally uses eager mode and writes tensors synchronously.
 It is a research utility, not a serving benchmark.
@@ -188,6 +191,7 @@ def collect(args: argparse.Namespace) -> None:
     os.environ["VLLM_MOE_TRACE_ACTIVATIONS"] = "input"
     os.environ["VLLM_MOE_TRACE_ACTIVATION_DTYPE"] = args.activation_dtype
     os.environ["VLLM_MOE_TRACE_TOKEN_SELECTION"] = "prefill_last"
+    os.environ["VLLM_MOE_TRACE_NEXT_GATE"] = "1" if args.trace_next_gate else "0"
 
     from multiprocessing import Process
 
@@ -247,6 +251,7 @@ def collect(args: argparse.Namespace) -> None:
         "activation_token_selection": (
             "last prompt token for prefill; each token for decode"
         ),
+        "trace_next_gate": args.trace_next_gate,
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
@@ -324,7 +329,7 @@ def _expert_load_cosine(
     return float(np.dot(counts, next_counts) / denominator)
 
 
-def _topk_set_jaccard(
+def _topk_overlap_ratio(
     layer_routes: np.ndarray,
     next_layer_routes: np.ndarray,
     num_experts: int,
@@ -333,24 +338,38 @@ def _topk_set_jaccard(
     if num_tokens == 0:
         return np.nan
 
+    similarities = _topk_overlap_values(
+        layer_routes[:num_tokens],
+        next_layer_routes[:num_tokens],
+        num_experts,
+    )
+    if not similarities:
+        return np.nan
+    return float(np.mean(similarities))
+
+
+def _topk_overlap_values(
+    candidate_routes: np.ndarray,
+    reference_routes: np.ndarray,
+    num_experts: int,
+) -> list[float]:
+    num_tokens = min(candidate_routes.shape[0], reference_routes.shape[0])
     similarities: list[float] = []
     for token_id in range(num_tokens):
         current = {
             int(expert_id)
-            for expert_id in layer_routes[token_id]
+            for expert_id in candidate_routes[token_id]
             if 0 <= expert_id < num_experts
         }
         following = {
             int(expert_id)
-            for expert_id in next_layer_routes[token_id]
+            for expert_id in reference_routes[token_id]
             if 0 <= expert_id < num_experts
         }
-        union = current | following
-        if union:
-            similarities.append(len(current & following) / len(union))
-    if not similarities:
-        return np.nan
-    return float(np.mean(similarities))
+        denominator = max(len(current), len(following))
+        if denominator:
+            similarities.append(len(current & following) / denominator)
+    return similarities
 
 
 def _adjacent_route_similarities(
@@ -366,7 +385,7 @@ def _adjacent_route_similarities(
     num_layers = min(routes.shape[1] for routes in samples)
     rows: list[dict[str, float | int]] = []
     for layer_id in range(num_layers - 1):
-        token_jaccard_values = []
+        topk_overlap_values = []
         load_cosine_values = []
         for sample_id, routes in enumerate(samples):
             if routes.ndim != 3:
@@ -383,7 +402,7 @@ def _adjacent_route_similarities(
                 continue
             layer_routes = selected_routes[:, layer_id, :]
             next_layer_routes = selected_routes[:, layer_id + 1, :]
-            token_jaccard = _topk_set_jaccard(
+            topk_overlap = _topk_overlap_ratio(
                 layer_routes,
                 next_layer_routes,
                 num_experts,
@@ -393,8 +412,8 @@ def _adjacent_route_similarities(
                 next_layer_routes,
                 num_experts,
             )
-            if not np.isnan(token_jaccard):
-                token_jaccard_values.append(token_jaccard)
+            if not np.isnan(topk_overlap):
+                topk_overlap_values.append(topk_overlap)
             if not np.isnan(load_cosine):
                 load_cosine_values.append(load_cosine)
 
@@ -402,12 +421,12 @@ def _adjacent_route_similarities(
             {
                 "layer_i": layer_id,
                 "layer_j": layer_id + 1,
-                "num_samples": len(token_jaccard_values),
-                "token_jaccard_mean": float(np.mean(token_jaccard_values))
-                if token_jaccard_values
+                "num_samples": len(topk_overlap_values),
+                "topk_overlap_mean": float(np.mean(topk_overlap_values))
+                if topk_overlap_values
                 else np.nan,
-                "token_jaccard_std": float(np.std(token_jaccard_values))
-                if token_jaccard_values
+                "topk_overlap_std": float(np.std(topk_overlap_values))
+                if topk_overlap_values
                 else np.nan,
                 "load_cosine_mean": float(np.mean(load_cosine_values))
                 if load_cosine_values
@@ -499,7 +518,7 @@ def _write_route_similarity_data(
     phase: str,
 ) -> None:
     csv_header = (
-        "layer_i,layer_j,num_samples,token_jaccard_mean,token_jaccard_std,"
+        "layer_i,layer_j,num_samples,topk_overlap_mean,topk_overlap_std,"
         "load_cosine_mean,load_cosine_std"
     )
     csv_rows = []
@@ -510,8 +529,8 @@ def _write_route_similarity_data(
                     str(row["layer_i"]),
                     str(row["layer_j"]),
                     str(row["num_samples"]),
-                    f"{row['token_jaccard_mean']:.6f}",
-                    f"{row['token_jaccard_std']:.6f}",
+                    f"{row['topk_overlap_mean']:.6f}",
+                    f"{row['topk_overlap_std']:.6f}",
                     f"{row['load_cosine_mean']:.6f}",
                     f"{row['load_cosine_std']:.6f}",
                 ]
@@ -529,12 +548,12 @@ def _write_route_similarity_data(
     np.savez_compressed(
         output.with_suffix(".npz"),
         layer_pairs=layer_pairs,
-        token_jaccard_mean=np.array(
-            [row["token_jaccard_mean"] for row in rows],
+        topk_overlap_mean=np.array(
+            [row["topk_overlap_mean"] for row in rows],
             dtype=np.float64,
         ),
-        token_jaccard_std=np.array(
-            [row["token_jaccard_std"] for row in rows],
+        topk_overlap_std=np.array(
+            [row["topk_overlap_std"] for row in rows],
             dtype=np.float64,
         ),
         load_cosine_mean=np.array(
@@ -550,9 +569,9 @@ def _write_route_similarity_data(
     json_payload = {
         "phase": phase,
         "metrics": {
-            "token_jaccard": (
-                "Mean per-token Jaccard similarity between the top-k expert "
-                "sets selected by adjacent layers."
+            "topk_overlap": (
+                "Mean per-token overlap ratio between adjacent layers' top-k "
+                "expert sets: same experts divided by the per-token top-k size."
             ),
             "load_cosine": (
                 "Cosine similarity between adjacent layers' aggregate expert "
@@ -587,10 +606,10 @@ def plot_route_similarity(args: argparse.Namespace) -> None:
     layer_labels = [f"{row['layer_i']}→{row['layer_j']}" for row in rows]
     x = np.arange(len(rows))
     metric_specs = {
-        "token-jaccard": (
-            "token_jaccard_mean",
-            "token_jaccard_std",
-            "Token top-k Jaccard",
+        "topk-overlap": (
+            "topk_overlap_mean",
+            "topk_overlap_std",
+            "Same expert / top-k",
         ),
         "load-cosine": ("load_cosine_mean", "load_cosine_std", "Expert load cosine"),
     }
@@ -620,12 +639,202 @@ def plot_route_similarity(args: argparse.Namespace) -> None:
     ax.grid(alpha=0.2)
     ax.legend()
     title = metadata.get("model", "MoE route similarity")
-    ax.set_title(f"{title}: adjacent routed-expert similarity ({args.phase})")
+    ax.set_title(f"{title}: adjacent routed-expert overlap ({args.phase})")
     fig.tight_layout()
 
     output = args.output or trace_dir / f"route_similarity_{args.phase}.png"
     fig.savefig(output, dpi=220, bbox_inches="tight")
     _write_route_similarity_data(output, rows, metadata, args.phase)
+    print(f"Saved {output} and matching .csv/.json/.npz data")
+
+
+def _phase_mask(record: dict[str, Any], phase: str) -> np.ndarray | None:
+    if phase == "all":
+        return None
+    token_phases = record.get("token_phases")
+    if token_phases is None:
+        return None
+    phase_code = 0 if phase == "prefill" else 1
+    return token_phases.numpy() == phase_code
+
+
+def _load_next_gate_overlap_rows(
+    trace_dir: Path,
+    rank: int | None,
+    num_experts: int,
+    phase: str,
+) -> list[dict[str, float | int]]:
+    import torch
+
+    activation_root = trace_dir / "activations"
+    if rank is None:
+        rank_dirs = sorted(activation_root.glob("rank_*"))
+    else:
+        rank_dirs = [activation_root / f"rank_{rank:05d}"]
+
+    records: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for rank_dir in rank_dirs:
+        if not rank_dir.exists():
+            continue
+        rank_id = int(rank_dir.name.removeprefix("rank_"))
+        for path in sorted(rank_dir.glob("step_*_layer_*.pt")):
+            record = torch.load(path, map_location="cpu", weights_only=True)
+            key = (rank_id, int(record["step"]), int(record["layer_id"]))
+            records[key] = record
+    if not records:
+        raise ValueError(f"No activation records found under {activation_root}")
+
+    grouped_values: dict[tuple[int, int], list[float]] = {}
+    grouped_steps: dict[tuple[int, int], int] = {}
+    for (rank_id, step, layer_id), record in records.items():
+        if "next_gate_predicted_topk_ids" not in record:
+            continue
+        next_layer_id = int(record["next_gate_layer_id"])
+        next_record = records.get((rank_id, step, next_layer_id))
+        if next_record is None:
+            continue
+
+        predicted = record["next_gate_predicted_topk_ids"].numpy()
+        actual = next_record["topk_ids"].numpy()
+        mask = _phase_mask(record, phase)
+        if mask is not None:
+            predicted = predicted[mask]
+            actual = actual[mask]
+        if predicted.shape[0] == 0 or actual.shape[0] == 0:
+            continue
+
+        pair = (layer_id, next_layer_id)
+        values = _topk_overlap_values(predicted, actual, num_experts)
+        if values:
+            grouped_values.setdefault(pair, []).extend(values)
+            grouped_steps[pair] = grouped_steps.get(pair, 0) + 1
+
+    if not grouped_values:
+        raise ValueError(
+            "No next-gate predictions found. Re-run collect with "
+            "--trace-next-gate to save next_gate_predicted_topk_ids."
+        )
+
+    rows: list[dict[str, float | int]] = []
+    for layer_i, layer_j in sorted(grouped_values):
+        values = grouped_values[(layer_i, layer_j)]
+        rows.append(
+            {
+                "layer_i": layer_i,
+                "layer_j": layer_j,
+                "num_steps": grouped_steps[(layer_i, layer_j)],
+                "num_tokens": len(values),
+                "topk_overlap_mean": float(np.mean(values)),
+                "topk_overlap_std": float(np.std(values)),
+            }
+        )
+    return rows
+
+
+def _write_next_gate_similarity_data(
+    output: Path,
+    rows: list[dict[str, float | int]],
+    metadata: dict[str, Any],
+    phase: str,
+) -> None:
+    csv_header = (
+        "layer_i,layer_j,num_steps,num_tokens,topk_overlap_mean,topk_overlap_std"
+    )
+    csv_rows = []
+    for row in rows:
+        csv_rows.append(
+            ",".join(
+                [
+                    str(row["layer_i"]),
+                    str(row["layer_j"]),
+                    str(row["num_steps"]),
+                    str(row["num_tokens"]),
+                    f"{row['topk_overlap_mean']:.6f}",
+                    f"{row['topk_overlap_std']:.6f}",
+                ]
+            )
+        )
+    output.with_suffix(".csv").write_text(
+        csv_header + "\n" + "\n".join(csv_rows) + "\n",
+        encoding="utf-8",
+    )
+
+    np.savez_compressed(
+        output.with_suffix(".npz"),
+        layer_pairs=np.array(
+            [[row["layer_i"], row["layer_j"]] for row in rows],
+            dtype=np.int64,
+        ),
+        topk_overlap_mean=np.array(
+            [row["topk_overlap_mean"] for row in rows],
+            dtype=np.float64,
+        ),
+        topk_overlap_std=np.array(
+            [row["topk_overlap_std"] for row in rows],
+            dtype=np.float64,
+        ),
+        num_tokens=np.array([row["num_tokens"] for row in rows], dtype=np.int64),
+    )
+
+    output.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "phase": phase,
+                "metric": (
+                    "For each layer pair i->i+1, feed layer i's traced MoE "
+                    "router input into layer i+1's gate/router, then compare "
+                    "that predicted top-k set with layer i+1's actual top-k "
+                    "set. The value is same experts divided by top-k."
+                ),
+                "model": metadata.get("model"),
+                "num_experts": metadata.get("num_experts"),
+                "rows": rows,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def plot_next_gate_similarity(args: argparse.Namespace) -> None:
+    import matplotlib.pyplot as plt
+
+    trace_dir = args.trace_dir.resolve()
+    metadata = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
+    num_experts = args.num_experts or int(metadata["num_experts"])
+    rows = _load_next_gate_overlap_rows(
+        trace_dir,
+        args.rank,
+        num_experts,
+        args.phase,
+    )
+
+    layer_labels = [f"{row['layer_i']}→{row['layer_j']}" for row in rows]
+    x = np.arange(len(rows))
+    means = np.array([row["topk_overlap_mean"] for row in rows], dtype=np.float64)
+    stds = np.array([row["topk_overlap_std"] for row in rows], dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(max(8.0, len(rows) * 0.55), 4.8))
+    ax.plot(x, means, marker="o", linewidth=1.8, label="Same expert / top-k")
+    ax.fill_between(
+        x,
+        np.maximum(means - stds, 0.0),
+        np.minimum(means + stds, 1.0),
+        alpha=0.15,
+    )
+    ax.set_xticks(x, labels=layer_labels, rotation=90)
+    ax.set_ylim(0.0, 1.02)
+    ax.set_xlabel("Layer i activation -> layer i+1 gate")
+    ax.set_ylabel("Overlap ratio")
+    ax.grid(alpha=0.2)
+    ax.legend()
+    title = metadata.get("model", "MoE next-gate overlap")
+    ax.set_title(f"{title}: predicted vs actual next-layer top-k ({args.phase})")
+    fig.tight_layout()
+
+    output = args.output or trace_dir / f"next_gate_similarity_{args.phase}.png"
+    fig.savefig(output, dpi=220, bbox_inches="tight")
+    _write_next_gate_similarity_data(output, rows, metadata, args.phase)
     print(f"Saved {output} and matching .csv/.json/.npz data")
 
 
@@ -820,6 +1029,14 @@ def parse_args() -> argparse.Namespace:
         choices=("float16", "bfloat16", "float32"),
         default="float16",
     )
+    collect_parser.add_argument(
+        "--trace-next-gate",
+        action="store_true",
+        help=(
+            "Also save, for each layer i, the top-k experts predicted by "
+            "feeding layer i's traced router input to layer i+1's gate/router."
+        ),
+    )
     collect_parser.set_defaults(func=collect)
 
     expert_parser = subparsers.add_parser("plot-experts")
@@ -840,11 +1057,25 @@ def parse_args() -> argparse.Namespace:
     )
     route_similarity_parser.add_argument(
         "--metric",
-        choices=("token-jaccard", "load-cosine", "all"),
-        default="all",
+        choices=("topk-overlap", "load-cosine", "all"),
+        default="topk-overlap",
     )
     route_similarity_parser.add_argument("--output", type=Path)
     route_similarity_parser.set_defaults(func=plot_route_similarity)
+
+    next_gate_parser = subparsers.add_parser("plot-next-gate-similarity")
+    next_gate_parser.add_argument("--trace-dir", type=Path, required=True)
+    next_gate_parser.add_argument(
+        "--rank",
+        type=int,
+        help="Analyze one EP rank; by default traces from all ranks are merged.",
+    )
+    next_gate_parser.add_argument("--num-experts", type=int)
+    next_gate_parser.add_argument(
+        "--phase", choices=("prefill", "decode", "all"), default="all"
+    )
+    next_gate_parser.add_argument("--output", type=Path)
+    next_gate_parser.set_defaults(func=plot_next_gate_similarity)
 
     activation_parser = subparsers.add_parser("plot-activations")
     activation_parser.add_argument("--trace-dir", type=Path, required=True)
