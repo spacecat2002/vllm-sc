@@ -37,6 +37,23 @@ from typing import Any
 import numpy as np
 
 
+MOE_BACKEND_CHOICES = (
+    "auto",
+    "triton",
+    "deep_gemm",
+    "deep_gemm_mega_moe",
+    "cutlass",
+    "flashinfer_trtllm",
+    "flashinfer_cutlass",
+    "flashinfer_cutedsl",
+    "flashinfer_b12x",
+    "marlin",
+    "humming",
+    "triton_unfused",
+    "aiter",
+    "emulation",
+)
+
 DEFAULT_PROMPTS = [
     "Explain why the sky is blue.",
     "Write a short Python merge-sort function.",
@@ -93,6 +110,7 @@ def _collect_dp_rank(
         enable_chunked_prefill=False,
         enforce_eager=True,
         enable_return_routed_experts=True,
+        moe_backend=args.moe_backend,
     )
     sampling_params = SamplingParams(
         temperature=0,
@@ -251,6 +269,7 @@ def collect(args: argparse.Namespace) -> None:
             "last prompt token for prefill; each token for decode"
         ),
         "trace_next_gate": args.trace_next_gate,
+        "moe_backend": args.moe_backend,
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
@@ -1035,6 +1054,12 @@ def parse_args() -> argparse.Namespace:
             "Also save, for each layer i, the top-k experts predicted by "
             "feeding layer i's traced router input to layer i+1's gate/router."
         ),
+    )
+    collect_parser.add_argument(
+        "--moe-backend",
+        choices=MOE_BACKEND_CHOICES,
+        default="auto",
+        help="MoE expert-kernel backend to pass to vLLM, e.g. triton.",
     )
     collect_parser.set_defaults(func=collect)
 
