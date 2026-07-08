@@ -215,6 +215,11 @@ def make_rank_skewed_ids(
     hot_share: float,
 ) -> torch.Tensor:
     total = tokens * top_k
+    num_experts = num_local_experts * world_size
+    if top_k > num_experts:
+        raise ValueError(
+            f"top_k={top_k} cannot be greater than num_experts={num_experts}."
+        )
     normalized_hot_rank = hot_rank % world_size
     counts = [0] * world_size
     if world_size == 1:
@@ -240,10 +245,24 @@ def make_rank_skewed_ids(
 
     seen_per_rank = [0] * world_size
     expert_ids = []
-    for target_rank in targets:
-        local_expert = seen_per_rank[target_rank] % num_local_experts
-        expert_ids.append(target_rank * num_local_experts + local_expert)
-        seen_per_rank[target_rank] += 1
+    for token_start in range(0, total, top_k):
+        used_experts: set[int] = set()
+        token_targets = targets[token_start : token_start + top_k]
+        for target_rank in token_targets:
+            for _ in range(num_local_experts):
+                local_expert = seen_per_rank[target_rank] % num_local_experts
+                expert_id = target_rank * num_local_experts + local_expert
+                seen_per_rank[target_rank] += 1
+                if expert_id not in used_experts:
+                    expert_ids.append(expert_id)
+                    used_experts.add(expert_id)
+                    break
+            else:
+                raise ValueError(
+                    "Cannot generate unique top-k experts for one token. "
+                    f"top_k={top_k}, target_rank={target_rank}, "
+                    f"num_local_experts={num_local_experts}."
+                )
     return torch.tensor(expert_ids, dtype=torch.int64).view(tokens, top_k)
 
 
