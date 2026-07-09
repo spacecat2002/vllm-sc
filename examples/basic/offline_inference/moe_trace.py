@@ -63,10 +63,104 @@ DEFAULT_PROMPTS = [
 ]
 
 
+_ASSISTANT_ROLES = {"assistant", "gpt"}
+_ROLE_LABELS = {
+    "assistant": "Assistant",
+    "gpt": "Assistant",
+    "human": "User",
+    "system": "System",
+    "user": "User",
+}
+
+
+def _iter_json_prompt_items(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "prompts", "instances", "samples"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        conversations = payload.get("conversations") or payload.get("messages")
+        if isinstance(conversations, list):
+            return [payload]
+    return []
+
+
+def _format_sharegpt_prompt(item: Any) -> str | None:
+    if isinstance(item, str):
+        prompt = item.strip()
+        return prompt or None
+    if not isinstance(item, dict):
+        return None
+
+    conversations = item.get("conversations") or item.get("messages")
+    if not isinstance(conversations, list):
+        prompt = item.get("prompt") or item.get("text")
+        if isinstance(prompt, str):
+            prompt = prompt.strip()
+            return prompt or None
+        return None
+
+    turns: list[tuple[str, str]] = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("from") or turn.get("role") or "").strip().lower()
+        text = turn.get("value")
+        if text is None:
+            text = turn.get("content")
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        turns.append((role, text))
+
+    if not turns:
+        return None
+    if turns[-1][0] in _ASSISTANT_ROLES:
+        turns = turns[:-1]
+    if not turns:
+        return None
+
+    lines = []
+    for role, text in turns:
+        label = _ROLE_LABELS.get(role, role.title() if role else "User")
+        lines.append(f"{label}: {text}")
+    if turns[-1][0] not in _ASSISTANT_ROLES:
+        lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def _read_json_prompts(path: Path) -> list[str]:
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        items = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                items.append(json.loads(line))
+    else:
+        items = _iter_json_prompt_items(json.loads(path.read_text(encoding="utf-8")))
+
+    prompts = []
+    for item in items:
+        prompt = _format_sharegpt_prompt(item)
+        if prompt:
+            prompts.append(prompt)
+    return prompts
+
+
 def _read_prompts(path: Path | None) -> list[str]:
     if path is None:
         return DEFAULT_PROMPTS
-    prompts = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    if path.suffix.lower() in (".json", ".jsonl"):
+        prompts = _read_json_prompts(path)
+    else:
+        prompts = [
+            line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+        ]
     prompts = [prompt for prompt in prompts if prompt]
     if not prompts:
         raise ValueError(f"No non-empty prompts found in {path}")

@@ -500,29 +500,12 @@ def maybe_attach_moe_trace(
         ]
         path = next((candidate for candidate in candidates if candidate.exists()), None)
         if path is None:
-            logger.warning(
-                "%s=%s has no LoRA file for layer %d -> %d",
-                _NEXT_GATE_LORA_DIR_ENV,
-                root,
-                source_layer_id,
-                next_layer_id,
-            )
             return None
         payload = torch.load(path, map_location=device, weights_only=True)
         lora_a = payload["lora_A"].to(device=device, dtype=dtype)
         lora_b = payload["lora_B"].to(device=device, dtype=dtype)
         rank = int(payload.get("rank", lora_a.shape[0]))
         alpha = float(payload.get("alpha", rank))
-        logger.warning(
-            "%s loaded next-gate LoRA for layer %d -> %d from %s "
-            "(rank=%d, alpha=%s)",
-            _NEXT_GATE_LORA_DIR_ENV,
-            source_layer_id,
-            next_layer_id,
-            path,
-            rank,
-            alpha,
-        )
         return {
             "lora_A": lora_a,
             "lora_B": lora_b,
@@ -533,21 +516,7 @@ def maybe_attach_moe_trace(
     next_gate_predictors = {}
     next_gate_missing_gate_layers = []
     next_gate_diagnostics = []
-    logger.warning(
-        "%s raw value on rank %d is %r; parsed trace_next_gate=%s",
-        _NEXT_GATE_ENV,
-        _distributed_rank(),
-        os.getenv(_NEXT_GATE_ENV),
-        config.trace_next_gate,
-    )
     if config.trace_next_gate:
-        logger.warning(
-            "%s enabled on rank %d; building next-gate predictors for %d "
-            "traceable MoE layers",
-            _NEXT_GATE_ENV,
-            _distributed_rank(),
-            len(layers),
-        )
         sorted_layers = sorted(layers, key=lambda item: item[1].layer_id)
         for (_, module), (next_name, next_module) in zip(
             sorted_layers,
@@ -571,16 +540,6 @@ def maybe_attach_moe_trace(
             }
             next_gate_diagnostics.append(diagnostic)
             if gate_projector is None:
-                logger.warning(
-                    "%s could not find gate for layer %d -> %d; "
-                    "next_layer_name=%s candidates=%s runner_gate=%s",
-                    _NEXT_GATE_ENV,
-                    module.layer_id,
-                    next_module.layer_id,
-                    next_name,
-                    diagnostic["gate_candidates"],
-                    diagnostic["runner_gate"],
-                )
                 next_gate_missing_gate_layers.append(
                     (module.layer_id, next_module.layer_id)
                 )
@@ -591,16 +550,6 @@ def maybe_attach_moe_trace(
                 next_module.layer_id,
                 reference_param.device,
                 reference_param.dtype,
-            )
-            logger.warning(
-                "%s using gate for layer %d -> %d from %s; "
-                "next_layer_name=%s runner_gate=%s",
-                _NEXT_GATE_ENV,
-                module.layer_id,
-                next_module.layer_id,
-                gate_source,
-                next_name,
-                diagnostic["runner_gate"],
             )
 
             @torch.no_grad()
