@@ -236,7 +236,6 @@ def _collect_dp_rank(
         enable_expert_parallel=True,
         max_model_len=args.max_model_len,
         max_num_seqs=min(len(prompts), collect_batch_size),
-        enable_chunked_prefill=False,
         enforce_eager=True,
         enable_return_routed_experts=True,
         moe_backend=args.moe_backend,
@@ -256,7 +255,7 @@ def _collect_dp_rank(
         request_outputs = llm.generate(
             batch_prompts,
             sampling_params,
-            use_tqdm=False,
+            use_tqdm=True,
         )
         for (sample_id, _), request_output in zip(
             batch_indexed_prompts,
