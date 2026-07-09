@@ -1202,6 +1202,60 @@ def _topk_overlap_from_logits(
     return float(overlap.mean().item())
 
 
+def _request_level_split_indices(
+    request_ids: list[str],
+    val_fraction: float,
+    seed: int,
+    device: "torch.device",
+) -> tuple["torch.Tensor", "torch.Tensor", int, int]:
+    import torch
+
+    if not 0 <= val_fraction < 1:
+        raise ValueError("--val-fraction must be in [0, 1)")
+
+    unique_request_ids = sorted(set(request_ids))
+    num_requests = len(unique_request_ids)
+    if num_requests == 0:
+        raise ValueError("No request ids found for LoRA training split")
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    if val_fraction > 0 and num_requests > 1:
+        val_request_count = int(num_requests * val_fraction)
+        val_request_count = max(1, val_request_count)
+        val_request_count = min(val_request_count, num_requests - 1)
+        request_order = torch.randperm(num_requests, generator=generator).tolist()
+        val_request_ids = {
+            unique_request_ids[index]
+            for index in request_order[:val_request_count]
+        }
+    else:
+        val_request_ids = set()
+
+    train_indices = [
+        index
+        for index, request_id in enumerate(request_ids)
+        if request_id not in val_request_ids
+    ]
+    val_indices = [
+        index
+        for index, request_id in enumerate(request_ids)
+        if request_id in val_request_ids
+    ]
+    if not train_indices:
+        raise ValueError(
+            "--val-fraction leaves no training requests; lower it or collect "
+            "more trace data"
+        )
+
+    return (
+        torch.tensor(train_indices, dtype=torch.long, device=device),
+        torch.tensor(val_indices, dtype=torch.long, device=device),
+        len(set(request_ids) - val_request_ids),
+        len(val_request_ids),
+    )
+
+
 def _load_next_gate_lora_training_data(
     trace_dir: Path,
     rank: int | None,
@@ -1241,12 +1295,26 @@ def _load_next_gate_lora_training_data(
         base_logits = record["next_gate_base_logits"]
         target_logits = next_record["router_logits"]
         labels = next_record["topk_ids"]
+        request_ids = record.get("request_ids")
+        if request_ids is None:
+            raise ValueError(
+                "Prompt-level LoRA validation split requires request_ids in "
+                "activation records. Re-run collect after this change."
+            )
+        if len(request_ids) != activations.shape[0]:
+            raise ValueError("Activation record request_ids length mismatch")
         mask = _phase_mask(record, phase)
         if mask is not None:
             activations = activations[mask]
             base_logits = base_logits[mask]
             target_logits = target_logits[mask]
             labels = labels[mask]
+            mask_list = mask.cpu().tolist()
+            request_ids = [
+                request_id
+                for request_id, keep in zip(request_ids, mask_list)
+                if keep
+            ]
         if activations.shape[0] == 0:
             continue
 
@@ -1259,6 +1327,7 @@ def _load_next_gate_lora_training_data(
                 "base_logits": [],
                 "target_logits": [],
                 "labels": [],
+                "request_ids": [],
                 "count": 0,
             },
         )
@@ -1271,22 +1340,29 @@ def _load_next_gate_lora_training_data(
             base_logits = base_logits[:remaining]
             target_logits = target_logits[:remaining]
             labels = labels[:remaining]
+            request_ids = request_ids[:remaining]
 
         entry["activations"].append(activations.to(torch.float32))
         entry["base_logits"].append(base_logits.to(torch.float32))
         entry["target_logits"].append(target_logits.to(torch.float32))
         entry["labels"].append(labels.to(torch.long).clamp(0, num_experts - 1))
+        entry["request_ids"].extend(str(request_id) for request_id in request_ids)
         entry["count"] = int(entry["count"]) + int(activations.shape[0])
 
     datasets: dict[int, dict[str, Any]] = {}
     for next_layer_id, entry in chunks.items():
+        activations = torch.cat(entry["activations"], dim=0)
+        request_ids = list(entry["request_ids"])
+        if len(request_ids) != activations.shape[0]:
+            raise ValueError("LoRA training request_ids length mismatch")
         datasets[next_layer_id] = {
             "source_layer_id": entry["source_layer_id"],
             "next_layer_id": next_layer_id,
-            "activations": torch.cat(entry["activations"], dim=0),
+            "activations": activations,
             "base_logits": torch.cat(entry["base_logits"], dim=0),
             "target_logits": torch.cat(entry["target_logits"], dim=0),
             "labels": torch.cat(entry["labels"], dim=0),
+            "request_ids": request_ids,
         }
     if not datasets:
         raise ValueError("No next-gate LoRA training examples were found")
@@ -1363,6 +1439,7 @@ def train_next_gate_lora(args: argparse.Namespace) -> list[dict[str, Any]]:
         base_logits = data["base_logits"].to(device=device)
         target_logits = data["target_logits"].to(device=device)
         labels = data["labels"].to(device=device)
+        request_ids = data["request_ids"]
         num_examples, hidden_size = x.shape
         num_experts = target_logits.shape[1]
         top_k = labels.shape[1]
@@ -1371,15 +1448,14 @@ def train_next_gate_lora(args: argparse.Namespace) -> list[dict[str, Any]]:
 
         generator = torch.Generator(device=device)
         generator.manual_seed(args.seed + next_layer_id)
-        perm = torch.randperm(num_examples, generator=generator, device=device)
-        val_count = int(num_examples * args.val_fraction)
-        val_indices = perm[:val_count]
-        train_indices = perm[val_count:] if val_count else perm
-        if train_indices.numel() == 0:
-            raise ValueError(
-                "--val-fraction leaves no training examples; lower it or "
-                "collect more trace data"
+        train_indices, val_indices, train_requests, val_requests = (
+            _request_level_split_indices(
+                request_ids,
+                args.val_fraction,
+                args.seed + next_layer_id,
+                device,
             )
+        )
 
         lora_a = torch.nn.Parameter(
             torch.empty((rank, hidden_size), device=device, dtype=torch.float32)
@@ -1419,7 +1495,7 @@ def train_next_gate_lora(args: argparse.Namespace) -> list[dict[str, Any]]:
                 total_loss += float(loss.item()) * batch.numel()
                 total_seen += int(batch.numel())
 
-            eval_indices = val_indices if val_count else train_indices
+            eval_indices = val_indices if val_indices.numel() else train_indices
             with torch.no_grad():
                 baseline_eval_logits = base_logits[eval_indices]
                 baseline_loss = loss_fn(
@@ -1479,6 +1555,8 @@ def train_next_gate_lora(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "num_examples": num_examples,
                 "train_examples": int(train_indices.numel()),
                 "val_examples": int(eval_indices.numel()),
+                "train_requests": train_requests,
+                "val_requests": val_requests,
                 "rank": rank,
                 "alpha": args.alpha,
                 "baseline_val_mse": float(baseline_loss.item()),
@@ -1512,6 +1590,8 @@ def train_next_gate_lora(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "batch_size": args.batch_size,
                 "target": "next_layer_router_logits",
                 "loss": "mse",
+                "validation_split": "request_level",
+                "val_fraction": args.val_fraction,
                 "summary": summary,
                 "results": results,
             },

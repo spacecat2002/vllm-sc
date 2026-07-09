@@ -140,6 +140,7 @@ class MoETraceCollector:
         self._seen_layers: set[int] = set()
         self._selected_token_indices: list[int] | None = None
         self._selected_token_phases: list[int] | None = None
+        self._selected_request_ids: list[str] | None = None
         self._write_metadata()
 
     def _write_metadata(self) -> None:
@@ -189,6 +190,7 @@ class MoETraceCollector:
         num_scheduled_tokens: list[int],
         num_computed_tokens: list[int],
         prefill_lengths: list[int],
+        request_ids: list[str] | None = None,
     ) -> None:
         """Describe the packed request layout for the next model forward.
 
@@ -200,6 +202,7 @@ class MoETraceCollector:
         if self.config.token_selection != "prefill_last":
             self._selected_token_indices = None
             self._selected_token_phases = None
+            self._selected_request_ids = None
             return
         if not (
             len(num_scheduled_tokens)
@@ -207,26 +210,35 @@ class MoETraceCollector:
             == len(prefill_lengths)
         ):
             raise ValueError("MoE trace request metadata lengths do not match")
+        if request_ids is None:
+            request_ids = [str(index) for index in range(len(num_scheduled_tokens))]
+        if len(request_ids) != len(num_scheduled_tokens):
+            raise ValueError("MoE trace request id count does not match batch size")
 
         indices: list[int] = []
         phases: list[int] = []
+        selected_request_ids: list[str] = []
         request_start = 0
-        for scheduled, computed, prefill_length in zip(
+        for scheduled, computed, prefill_length, request_id in zip(
             num_scheduled_tokens,
             num_computed_tokens,
             prefill_lengths,
+            request_ids,
         ):
             prompt_tokens = min(scheduled, max(prefill_length - computed, 0))
             if prompt_tokens > 0:
                 indices.append(request_start + prompt_tokens - 1)
                 phases.append(0)  # prefill
+                selected_request_ids.append(request_id)
             decode_start = request_start + prompt_tokens
             indices.extend(range(decode_start, request_start + scheduled))
             phases.extend([1] * (scheduled - prompt_tokens))  # decode
+            selected_request_ids.extend([request_id] * (scheduled - prompt_tokens))
             request_start += scheduled
 
         self._selected_token_indices = indices[: self.config.max_tokens]
         self._selected_token_phases = phases[: self.config.max_tokens]
+        self._selected_request_ids = selected_request_ids[: self.config.max_tokens]
 
     @torch.no_grad()
     def capture(
@@ -250,18 +262,21 @@ class MoETraceCollector:
         )
         selected_indices = self._selected_token_indices
         selected_phases = self._selected_token_phases
+        selected_request_ids = self._selected_request_ids
         if (
             self.config.token_selection == "prefill_last"
             and selected_indices is not None
         ):
             assert selected_phases is not None
+            assert selected_request_ids is not None
             valid = [
-                (index, selected_phases[pos])
+                (index, selected_phases[pos], selected_request_ids[pos])
                 for pos, index in enumerate(selected_indices)
                 if index < available_tokens
             ]
-            indices = [index for index, _ in valid]
-            token_phases = [phase for _, phase in valid]
+            indices = [index for index, _, _ in valid]
+            token_phases = [phase for _, phase, _ in valid]
+            request_ids = [request_id for _, _, request_id in valid]
             token_start = min(indices, default=0)
             token_end = max(indices, default=-1) + 1
             unique_phases = set(token_phases)
@@ -280,6 +295,7 @@ class MoETraceCollector:
             phase = "prefill"
             indices = [token_start]
             token_phases = [0]
+            request_ids = [f"step_{self.step:06d}_token_{token_start:06d}"]
         else:
             token_start = 0
             token_end = min(available_tokens, self.config.max_tokens)
@@ -287,6 +303,9 @@ class MoETraceCollector:
             indices = list(range(token_start, token_end))
             phase_code = 1 if phase == "decode" else -1
             token_phases = [phase_code] * len(indices)
+            request_ids = [
+                f"step_{self.step:06d}_token_{index:06d}" for index in indices
+            ]
 
         index_tensor = torch.tensor(
             indices,
@@ -308,6 +327,7 @@ class MoETraceCollector:
             "selected_token_end": token_end,
             "selected_token_indices": torch.tensor(indices, dtype=torch.int64),
             "token_phases": torch.tensor(token_phases, dtype=torch.int8),
+            "request_ids": request_ids,
             "router_logits": selected_router_logits.to(
                 device="cpu", dtype=self.config.activation_dtype
             ),
@@ -458,6 +478,7 @@ def maybe_attach_moe_trace(
             parent = _get_module_by_name(gate_name.rsplit(".", 1)[0])
             gate = getattr(parent, "gate", None) if parent is not None else None
             if gate is not None:
+
                 def _project_with_parent_gate(
                     hidden_states: torch.Tensor,
                     _gate=gate,

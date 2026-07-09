@@ -1140,6 +1140,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.num_scheduled_tokens.tolist(),
                     input_batch.num_computed_tokens_np.tolist(),
                     input_batch.prefill_len_np.tolist(),
+                    list(input_batch.req_ids),
                 )
 
             if self.lora_config:

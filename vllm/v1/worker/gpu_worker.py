@@ -358,6 +358,20 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        from vllm.model_executor.layers.fused_moe.next_gate_lora import (
+            maybe_attach_sc_eplb_next_gate_lora,
+        )
+
+        self.model_runner.sc_eplb_next_gate_lora = (
+            maybe_attach_sc_eplb_next_gate_lora(
+                static_forward_context=(
+                    self.vllm_config.compilation_config.static_forward_context
+                ),
+                model=self.model_runner.get_model(),
+                env_value=envs.VLLM_SC_EPLB,
+            )
+        )
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,

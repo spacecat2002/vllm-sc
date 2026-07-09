@@ -265,6 +265,17 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer_name
 
+        self._next_gate_predictor: (
+            tuple[int, Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]]
+            | None
+        ) = None
+        self._last_next_gate_prediction: (
+            tuple[int, torch.Tensor, torch.Tensor] | None
+        ) = None
+        self._next_gate_prediction_stream: torch.cuda.Stream | None = None
+        self._next_gate_prediction_stream_device: torch.device | None = None
+        self._next_gate_prediction_event: torch.cuda.Event | None = None
+
         self._forward_entry = self._select_forward()
 
     def _select_forward(self) -> Callable:
@@ -306,6 +317,78 @@ class MoERunner(MoERunnerInterface):
 
     def is_internal_router(self) -> bool:
         return self.gate is not None
+
+    def set_next_gate_predictor(
+        self,
+        next_layer_id: int,
+        predictor: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Attach a side-channel predictor for the next layer's MoE route.
+
+        The predictor is not used by normal expert execution. It only computes
+        a cached prediction from the same hidden states that enter this MoE
+        runner, so the real routing path remains unchanged.
+        """
+        self._next_gate_predictor = (next_layer_id, predictor)
+
+    def clear_next_gate_predictor(self) -> None:
+        self._next_gate_predictor = None
+        self._last_next_gate_prediction = None
+        self._next_gate_prediction_event = None
+
+    def get_last_next_gate_prediction(
+        self,
+        *,
+        wait: bool = True,
+    ) -> tuple[int, torch.Tensor, torch.Tensor] | None:
+        if wait and self._next_gate_prediction_event is not None:
+            self._next_gate_prediction_event.synchronize()
+            self._next_gate_prediction_event = None
+        return self._last_next_gate_prediction
+
+    def _get_next_gate_prediction_stream(
+        self,
+        device: torch.device,
+    ) -> torch.cuda.Stream:
+        if (
+            self._next_gate_prediction_stream is None
+            or self._next_gate_prediction_stream_device != device
+        ):
+            with torch.cuda.device(device):
+                self._next_gate_prediction_stream = torch.cuda.Stream()
+            self._next_gate_prediction_stream_device = device
+        return self._next_gate_prediction_stream
+
+    def _maybe_predict_next_gate(self, hidden_states: torch.Tensor) -> None:
+        if self._next_gate_predictor is None:
+            return
+        next_layer_id, predictor = self._next_gate_predictor
+        if not hidden_states.is_cuda:
+            predicted_topk_ids, base_router_logits = predictor(hidden_states)
+            self._next_gate_prediction_event = None
+            self._last_next_gate_prediction = (
+                next_layer_id,
+                predicted_topk_ids,
+                base_router_logits,
+            )
+            return
+
+        current_stream = torch.cuda.current_stream(hidden_states.device)
+        prediction_stream = self._get_next_gate_prediction_stream(
+            hidden_states.device,
+        )
+        prediction_stream.wait_stream(current_stream)
+        hidden_states.record_stream(prediction_stream)
+        with torch.cuda.stream(prediction_stream):
+            predicted_topk_ids, base_router_logits = predictor(hidden_states)
+            event = torch.cuda.Event()
+            event.record(prediction_stream)
+        self._last_next_gate_prediction = (
+            next_layer_id,
+            predicted_topk_ids,
+            base_router_logits,
+        )
+        self._next_gate_prediction_event = event
 
     def apply_routed_input_transform(
         self, hidden_states: torch.Tensor
@@ -514,6 +597,7 @@ class MoERunner(MoERunnerInterface):
         )
 
         if self._quant_method.is_monolithic:
+            self._maybe_predict_next_gate(hidden_states)
             fused_out = self._quant_method.apply_monolithic(
                 layer=layer,
                 x=hidden_states,
@@ -521,6 +605,7 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
+            self._maybe_predict_next_gate(hidden_states)
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
