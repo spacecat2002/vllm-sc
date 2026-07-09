@@ -167,6 +167,33 @@ def _read_prompts(path: Path | None) -> list[str]:
     return prompts
 
 
+def _sample_prompts(
+    prompts: list[str],
+    *,
+    num_prompts: int | None,
+    sample_mode: str,
+    seed: int,
+) -> tuple[list[str], list[int]]:
+    source_indices = list(range(len(prompts)))
+    if num_prompts is None or num_prompts >= len(prompts):
+        return prompts, source_indices
+    if num_prompts <= 0:
+        raise ValueError("--num-prompts must be positive")
+
+    if sample_mode == "first":
+        selected_indices = source_indices[:num_prompts]
+    elif sample_mode == "random":
+        rng = np.random.default_rng(seed)
+        selected_indices = sorted(
+            int(index)
+            for index in rng.choice(len(prompts), size=num_prompts, replace=False)
+        )
+    else:
+        raise ValueError(f"Unsupported --prompt-sample-mode: {sample_mode}")
+
+    return [prompts[index] for index in selected_indices], selected_indices
+
+
 def _num_experts(hf_config: Any) -> int:
     for name in ("num_experts", "n_routed_experts", "num_local_experts"):
         value = getattr(hf_config, name, None)
@@ -201,13 +228,14 @@ def _collect_dp_rank(
     from vllm import LLM, SamplingParams
 
     prompts = [prompt for _, prompt in indexed_prompts]
+    collect_batch_size = args.collect_batch_size or len(prompts)
     llm = LLM(
         model=args.model,
         # VLLM_DP_SIZE supplies DP=N, so EP_SIZE = TP_SIZE * DP_SIZE = N.
         tensor_parallel_size=1,
         enable_expert_parallel=True,
         max_model_len=args.max_model_len,
-        max_num_seqs=len(prompts),
+        max_num_seqs=min(len(prompts), collect_batch_size),
         enable_chunked_prefill=False,
         enforce_eager=True,
         enable_return_routed_experts=True,
@@ -219,19 +247,29 @@ def _collect_dp_rank(
         max_tokens=args.max_new_tokens,
     )
 
-    request_outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
     routes: dict[str, np.ndarray] = {}
     prompt_token_counts: dict[str, int] = {}
     generated_texts: dict[str, str] = {}
-    for (sample_id, _), request_output in zip(indexed_prompts, request_outputs):
-        completion_output = request_output.outputs[0]
-        routed_experts = completion_output.routed_experts
-        if routed_experts is None:
-            raise RuntimeError("vLLM did not return routed experts")
-        sample_key = f"sample_{sample_id:06d}"
-        routes[sample_key] = routed_experts
-        prompt_token_counts[sample_key] = len(request_output.prompt_token_ids)
-        generated_texts[sample_key] = completion_output.text
+    for start in range(0, len(indexed_prompts), collect_batch_size):
+        batch_indexed_prompts = indexed_prompts[start : start + collect_batch_size]
+        batch_prompts = [prompt for _, prompt in batch_indexed_prompts]
+        request_outputs = llm.generate(
+            batch_prompts,
+            sampling_params,
+            use_tqdm=False,
+        )
+        for (sample_id, _), request_output in zip(
+            batch_indexed_prompts,
+            request_outputs,
+        ):
+            completion_output = request_output.outputs[0]
+            routed_experts = completion_output.routed_experts
+            if routed_experts is None:
+                raise RuntimeError("vLLM did not return routed experts")
+            sample_key = f"sample_{sample_id:06d}"
+            routes[sample_key] = routed_experts
+            prompt_token_counts[sample_key] = len(request_output.prompt_token_ids)
+            generated_texts[sample_key] = completion_output.text
 
     np.savez_compressed(shard_dir / f"rank_{global_dp_rank:05d}.npz", **routes)
     shard_metadata = {
@@ -437,9 +475,17 @@ def collect(args: argparse.Namespace) -> None:
     shard_dir = output_dir / "route_shards" / uuid4().hex
     activation_dir.mkdir(parents=True, exist_ok=True)
     shard_dir.mkdir(parents=True, exist_ok=True)
-    prompts = _read_prompts(args.prompts)
+    all_prompts = _read_prompts(args.prompts)
+    prompts, source_prompt_indices = _sample_prompts(
+        all_prompts,
+        num_prompts=args.num_prompts,
+        sample_mode=args.prompt_sample_mode,
+        seed=args.prompt_sample_seed,
+    )
     if args.ep_size > len(prompts):
         raise ValueError("--ep-size cannot exceed the number of prompts")
+    if args.collect_batch_size is not None and args.collect_batch_size <= 0:
+        raise ValueError("--collect-batch-size must be positive")
 
     # Child ranks inherit trace configuration from this parent process.
     os.environ["VLLM_MOE_TRACE_DIR"] = str(activation_dir)
@@ -507,7 +553,12 @@ def collect(args: argparse.Namespace) -> None:
     metadata = {
         "model": args.model,
         "expert_parallel_size": args.ep_size,
+        "num_input_prompts": len(all_prompts),
         "num_samples": len(prompts),
+        "source_prompt_indices": source_prompt_indices,
+        "prompt_sample_mode": args.prompt_sample_mode,
+        "prompt_sample_seed": args.prompt_sample_seed,
+        "collect_batch_size": args.collect_batch_size,
         "num_experts": num_experts,
         "prompt_token_counts": prompt_token_counts,
         "sample_dp_ranks": sample_dp_ranks,
@@ -528,6 +579,7 @@ def collect(args: argparse.Namespace) -> None:
     generations = [
         {
             "sample_id": sample_id,
+            "source_prompt_index": source_prompt_indices[sample_id],
             "dp_rank": sample_dp_ranks[sample_id],
             "prompt": prompt,
             "generated_text": generated_texts[sample_id],
@@ -1496,6 +1548,10 @@ def run_next_gate_lora_pipeline(args: argparse.Namespace) -> None:
         "max_model_len": args.max_model_len,
         "max_new_tokens": args.max_new_tokens,
         "max_tokens_per_sample": args.max_tokens_per_sample,
+        "num_prompts": args.num_prompts,
+        "prompt_sample_mode": args.prompt_sample_mode,
+        "prompt_sample_seed": args.prompt_sample_seed,
+        "collect_batch_size": args.collect_batch_size,
         "timeout": args.timeout,
         "activation_dtype": args.activation_dtype,
         "trace_next_gate": True,
@@ -1837,6 +1893,34 @@ def parse_args() -> argparse.Namespace:
     collect_parser.add_argument("--max-new-tokens", type=int, default=16)
     collect_parser.add_argument("--max-tokens-per-sample", type=int, default=4096)
     collect_parser.add_argument(
+        "--num-prompts",
+        type=int,
+        help=(
+            "Use only this many prompts from --prompts. By default all prompts "
+            "are used."
+        ),
+    )
+    collect_parser.add_argument(
+        "--prompt-sample-mode",
+        choices=("first", "random"),
+        default="first",
+        help="How to choose prompts when --num-prompts is set.",
+    )
+    collect_parser.add_argument(
+        "--prompt-sample-seed",
+        type=int,
+        default=0,
+        help="Random seed used when --prompt-sample-mode=random.",
+    )
+    collect_parser.add_argument(
+        "--collect-batch-size",
+        type=int,
+        help=(
+            "Number of prompts passed to each llm.generate call per DP rank. "
+            "Also caps vLLM max_num_seqs for collection."
+        ),
+    )
+    collect_parser.add_argument(
         "--timeout",
         type=int,
         default=1800,
@@ -1996,6 +2080,34 @@ def parse_args() -> argparse.Namespace:
     pipeline_parser.add_argument("--max-model-len", type=int, default=4096)
     pipeline_parser.add_argument("--max-new-tokens", type=int, default=16)
     pipeline_parser.add_argument("--max-tokens-per-sample", type=int, default=4096)
+    pipeline_parser.add_argument(
+        "--num-prompts",
+        type=int,
+        help=(
+            "Use only this many prompts for each collection phase. By default "
+            "all prompts are used."
+        ),
+    )
+    pipeline_parser.add_argument(
+        "--prompt-sample-mode",
+        choices=("first", "random"),
+        default="first",
+        help="How to choose prompts when --num-prompts is set.",
+    )
+    pipeline_parser.add_argument(
+        "--prompt-sample-seed",
+        type=int,
+        default=0,
+        help="Random seed used when --prompt-sample-mode=random.",
+    )
+    pipeline_parser.add_argument(
+        "--collect-batch-size",
+        type=int,
+        help=(
+            "Number of prompts passed to each llm.generate call per DP rank. "
+            "Also caps vLLM max_num_seqs for collection."
+        ),
+    )
     pipeline_parser.add_argument(
         "--timeout",
         type=int,
