@@ -1148,7 +1148,48 @@ def _load_next_gate_lora_training_data(
     return datasets
 
 
-def train_next_gate_lora(args: argparse.Namespace) -> None:
+def _summarize_lora_results(
+    results: list[dict[str, Any]],
+) -> dict[str, float | int]:
+    total_examples = sum(int(row["val_examples"]) for row in results)
+    if total_examples == 0:
+        return {
+            "val_examples": 0,
+            "baseline_overlap": float("nan"),
+            "lora_overlap": float("nan"),
+            "overlap_delta": float("nan"),
+            "baseline_mse": float("nan"),
+            "lora_mse": float("nan"),
+            "mse_delta": float("nan"),
+        }
+    baseline_overlap = sum(
+        float(row["baseline_val_overlap"]) * int(row["val_examples"])
+        for row in results
+    ) / total_examples
+    lora_overlap = sum(
+        float(row["lora_val_overlap"]) * int(row["val_examples"])
+        for row in results
+    ) / total_examples
+    baseline_mse = sum(
+        float(row["baseline_val_mse"]) * int(row["val_examples"])
+        for row in results
+    ) / total_examples
+    lora_mse = sum(
+        float(row["lora_val_mse"]) * int(row["val_examples"])
+        for row in results
+    ) / total_examples
+    return {
+        "val_examples": total_examples,
+        "baseline_overlap": baseline_overlap,
+        "lora_overlap": lora_overlap,
+        "overlap_delta": lora_overlap - baseline_overlap,
+        "baseline_mse": baseline_mse,
+        "lora_mse": lora_mse,
+        "mse_delta": lora_mse - baseline_mse,
+    }
+
+
+def train_next_gate_lora(args: argparse.Namespace) -> list[dict[str, Any]]:
     import math
     import torch
 
@@ -1189,6 +1230,11 @@ def train_next_gate_lora(args: argparse.Namespace) -> None:
         val_count = int(num_examples * args.val_fraction)
         val_indices = perm[:val_count]
         train_indices = perm[val_count:] if val_count else perm
+        if train_indices.numel() == 0:
+            raise ValueError(
+                "--val-fraction leaves no training examples; lower it or "
+                "collect more trace data"
+            )
 
         lora_a = torch.nn.Parameter(
             torch.empty((rank, hidden_size), device=device, dtype=torch.float32)
@@ -1230,6 +1276,17 @@ def train_next_gate_lora(args: argparse.Namespace) -> None:
 
             eval_indices = val_indices if val_count else train_indices
             with torch.no_grad():
+                baseline_eval_logits = base_logits[eval_indices]
+                baseline_loss = loss_fn(
+                    baseline_eval_logits,
+                    target_logits[eval_indices],
+                )
+                baseline_overlap = _topk_overlap_from_logits(
+                    baseline_eval_logits,
+                    labels[eval_indices],
+                    top_k,
+                    num_experts,
+                )
                 eval_logits = (
                     base_logits[eval_indices]
                     + ((x[eval_indices] @ lora_a.T) @ lora_b.T) * scale
@@ -1250,7 +1307,8 @@ def train_next_gate_lora(args: argparse.Namespace) -> None:
                     f"layer {source_layer_id}->{next_layer_id} "
                     f"epoch {epoch + 1}/{args.epochs}: "
                     f"loss={mean_loss:.6f}, val_mse={eval_loss.item():.6f}, "
-                    f"topk_overlap={eval_overlap:.4f}"
+                    f"baseline_overlap={baseline_overlap:.4f}, "
+                    f"lora_overlap={eval_overlap:.4f}"
                 )
 
         path = output_dir / (
@@ -1274,19 +1332,28 @@ def train_next_gate_lora(args: argparse.Namespace) -> None:
                 "source_layer_id": source_layer_id,
                 "next_layer_id": next_layer_id,
                 "num_examples": num_examples,
+                "train_examples": int(train_indices.numel()),
+                "val_examples": int(eval_indices.numel()),
                 "rank": rank,
                 "alpha": args.alpha,
-                "eval_mse": float(eval_loss.item()),
-                "eval_overlap": eval_overlap,
+                "baseline_val_mse": float(baseline_loss.item()),
+                "lora_val_mse": float(eval_loss.item()),
+                "mse_delta": float(eval_loss.item() - baseline_loss.item()),
+                "baseline_val_overlap": baseline_overlap,
+                "lora_val_overlap": eval_overlap,
+                "overlap_delta": eval_overlap - baseline_overlap,
                 "path": str(path),
             }
         )
         print(
             f"Saved {path} "
-            f"(examples={num_examples}, eval_mse={eval_loss.item():.6f}, "
-            f"eval_overlap={eval_overlap:.4f})"
+            f"(train={train_indices.numel()}, val={eval_indices.numel()}, "
+            f"baseline_overlap={baseline_overlap:.4f}, "
+            f"lora_overlap={eval_overlap:.4f}, "
+            f"delta={eval_overlap - baseline_overlap:+.4f})"
         )
 
+    summary = _summarize_lora_results(results)
     (output_dir / "metadata.json").write_text(
         json.dumps(
             {
@@ -1300,12 +1367,23 @@ def train_next_gate_lora(args: argparse.Namespace) -> None:
                 "batch_size": args.batch_size,
                 "target": "next_layer_router_logits",
                 "loss": "mse",
+                "summary": summary,
                 "results": results,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
+    print(
+        "LoRA validation summary: "
+        f"baseline_overlap={summary['baseline_overlap']:.4f}, "
+        f"lora_overlap={summary['lora_overlap']:.4f}, "
+        f"delta={summary['overlap_delta']:+.4f}; "
+        f"baseline_mse={summary['baseline_mse']:.6f}, "
+        f"lora_mse={summary['lora_mse']:.6f}, "
+        f"delta={summary['mse_delta']:+.6f}"
+    )
+    return results
 
 
 def run_next_gate_lora_pipeline(args: argparse.Namespace) -> None:
@@ -1333,18 +1411,28 @@ def run_next_gate_lora_pipeline(args: argparse.Namespace) -> None:
         "delete_unpacked_activations": args.delete_unpacked_activations,
     }
 
-    print(f"[1/4] Collecting training trace under {train_trace_dir}")
-    collect(
-        argparse.Namespace(
-            **common_collect,
-            prompts=train_prompts,
-            output_dir=train_trace_dir,
-            next_gate_lora_dir=None,
+    skip_train_collect = args.skip_collect or args.skip_train_collect
+    skip_eval_collect = args.skip_collect or args.skip_eval_collect
+
+    if skip_train_collect:
+        print(f"[1/4] Reusing existing training trace under {train_trace_dir}")
+        if not (train_trace_dir / "metadata.json").exists():
+            raise FileNotFoundError(
+                f"--skip-train-collect requires {train_trace_dir}/metadata.json"
+            )
+    else:
+        print(f"[1/4] Collecting training trace under {train_trace_dir}")
+        collect(
+            argparse.Namespace(
+                **common_collect,
+                prompts=train_prompts,
+                output_dir=train_trace_dir,
+                next_gate_lora_dir=None,
+            )
         )
-    )
 
     print(f"[2/4] Training next-gate LoRA adapters under {lora_dir}")
-    train_next_gate_lora(
+    lora_results = train_next_gate_lora(
         argparse.Namespace(
             trace_dir=train_trace_dir,
             output_dir=lora_dir,
@@ -1364,16 +1452,20 @@ def run_next_gate_lora_pipeline(args: argparse.Namespace) -> None:
             verbose=args.verbose,
         )
     )
+    lora_summary = _summarize_lora_results(lora_results)
 
-    print(f"[3/4] Collecting LoRA eval trace under {eval_trace_dir}")
-    collect(
-        argparse.Namespace(
-            **common_collect,
-            prompts=eval_prompts,
-            output_dir=eval_trace_dir,
-            next_gate_lora_dir=lora_dir,
+    if skip_eval_collect:
+        print(f"[3/4] Skipping LoRA eval collect under {eval_trace_dir}")
+    else:
+        print(f"[3/4] Collecting LoRA eval trace under {eval_trace_dir}")
+        collect(
+            argparse.Namespace(
+                **common_collect,
+                prompts=eval_prompts,
+                output_dir=eval_trace_dir,
+                next_gate_lora_dir=lora_dir,
+            )
         )
-    )
 
     print("[4/4] Writing baseline and LoRA eval plots/data")
     baseline_output = work_dir / f"baseline_next_gate_similarity_{args.eval_phase}.png"
@@ -1387,15 +1479,23 @@ def run_next_gate_lora_pipeline(args: argparse.Namespace) -> None:
             output=baseline_output,
         )
     )
-    plot_next_gate_similarity(
-        argparse.Namespace(
-            trace_dir=eval_trace_dir,
-            rank=args.eval_rank,
-            num_experts=args.num_experts,
-            phase=args.eval_phase,
-            output=lora_output,
+    lora_plot = None
+    if (eval_trace_dir / "metadata.json").exists():
+        plot_next_gate_similarity(
+            argparse.Namespace(
+                trace_dir=eval_trace_dir,
+                rank=args.eval_rank,
+                num_experts=args.num_experts,
+                phase=args.eval_phase,
+                output=lora_output,
+            )
         )
-    )
+        lora_plot = str(lora_output)
+    else:
+        print(
+            f"Skipping LoRA plot because {eval_trace_dir}/metadata.json "
+            "does not exist"
+        )
 
     summary = {
         "model": args.model,
@@ -1403,13 +1503,69 @@ def run_next_gate_lora_pipeline(args: argparse.Namespace) -> None:
         "lora_dir": str(lora_dir),
         "eval_trace_dir": str(eval_trace_dir),
         "baseline_plot": str(baseline_output),
-        "lora_plot": str(lora_output),
+        "lora_plot": lora_plot,
+        "offline_validation": lora_summary,
         "train_prompts": str(train_prompts) if train_prompts is not None else None,
         "eval_prompts": str(eval_prompts) if eval_prompts is not None else None,
     }
+    comparison_payload = {
+        "summary": lora_summary,
+        "per_layer": lora_results,
+    }
+    (work_dir / "accuracy_comparison.json").write_text(
+        json.dumps(comparison_payload, indent=2), encoding="utf-8"
+    )
+    comparison_rows = [
+        (
+            "source_layer_id,next_layer_id,val_examples,"
+            "baseline_overlap,lora_overlap,overlap_delta,"
+            "baseline_mse,lora_mse,mse_delta"
+        )
+    ]
+    for row in lora_results:
+        comparison_rows.append(
+            ",".join(
+                [
+                    str(row["source_layer_id"]),
+                    str(row["next_layer_id"]),
+                    str(row["val_examples"]),
+                    f"{row['baseline_val_overlap']:.6f}",
+                    f"{row['lora_val_overlap']:.6f}",
+                    f"{row['overlap_delta']:.6f}",
+                    f"{row['baseline_val_mse']:.6f}",
+                    f"{row['lora_val_mse']:.6f}",
+                    f"{row['mse_delta']:.6f}",
+                ]
+            )
+        )
+    comparison_rows.append(
+        ",".join(
+            [
+                "overall",
+                "overall",
+                str(lora_summary["val_examples"]),
+                f"{lora_summary['baseline_overlap']:.6f}",
+                f"{lora_summary['lora_overlap']:.6f}",
+                f"{lora_summary['overlap_delta']:.6f}",
+                f"{lora_summary['baseline_mse']:.6f}",
+                f"{lora_summary['lora_mse']:.6f}",
+                f"{lora_summary['mse_delta']:.6f}",
+            ]
+        )
+    )
+    (work_dir / "accuracy_comparison.csv").write_text(
+        "\n".join(comparison_rows) + "\n", encoding="utf-8"
+    )
     (work_dir / "pipeline_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
+    print(
+        "Offline validation comparison: "
+        f"before={lora_summary['baseline_overlap']:.4f}, "
+        f"after={lora_summary['lora_overlap']:.4f}, "
+        f"delta={lora_summary['overlap_delta']:+.4f}"
+    )
+    print(f"Accuracy comparison: {work_dir / 'accuracy_comparison.csv'}")
     print(f"Pipeline complete. Summary: {work_dir / 'pipeline_summary.json'}")
 
 
@@ -1645,7 +1801,7 @@ def parse_args() -> argparse.Namespace:
     expert_parser.add_argument("--layers", type=int, nargs="+")
     expert_parser.add_argument("--num-experts", type=int)
     expert_parser.add_argument(
-        "--phase", choices=("prefill", "decode", "all"), default="prefill"
+        "--phase", choices=("prefill", "decode", "all"), default="all"
     )
     expert_parser.add_argument("--output", type=Path)
     expert_parser.set_defaults(func=plot_experts)
@@ -1713,6 +1869,27 @@ def parse_args() -> argparse.Namespace:
     )
     pipeline_parser.add_argument("--work-dir", type=Path, required=True)
     pipeline_parser.add_argument(
+        "--skip-collect",
+        action="store_true",
+        help=(
+            "Reuse existing train_trace/eval_trace under --work-dir and skip "
+            "both collection phases."
+        ),
+    )
+    pipeline_parser.add_argument(
+        "--skip-train-collect",
+        action="store_true",
+        help="Reuse --work-dir/train_trace and skip baseline training collection.",
+    )
+    pipeline_parser.add_argument(
+        "--skip-eval-collect",
+        action="store_true",
+        help=(
+            "Skip LoRA eval collection. Offline before/after validation from "
+            "the train trace split is still reported."
+        ),
+    )
+    pipeline_parser.add_argument(
         "--ep-size",
         dest="ep_size",
         type=int,
@@ -1777,7 +1954,15 @@ def parse_args() -> argparse.Namespace:
     pipeline_parser.add_argument("--batch-size", type=int, default=1024)
     pipeline_parser.add_argument("--lr", type=float, default=1e-3)
     pipeline_parser.add_argument("--weight-decay", type=float, default=0.0)
-    pipeline_parser.add_argument("--val-fraction", type=float, default=0.1)
+    pipeline_parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.1,
+        help=(
+            "Fraction of trace examples held out per layer for offline "
+            "before/after validation during LoRA training."
+        ),
+    )
     pipeline_parser.add_argument("--seed", type=int, default=0)
     pipeline_parser.add_argument("--device", help="Training device, e.g. cuda:0")
     pipeline_parser.add_argument("--max-examples-per-layer", type=int)
