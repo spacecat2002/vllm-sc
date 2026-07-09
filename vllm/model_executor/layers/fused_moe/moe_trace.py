@@ -29,9 +29,11 @@ _ACTIVATIONS_ENV = "VLLM_MOE_TRACE_ACTIVATIONS"
 _ACTIVATION_DTYPE_ENV = "VLLM_MOE_TRACE_ACTIVATION_DTYPE"
 _TOKEN_SELECTION_ENV = "VLLM_MOE_TRACE_TOKEN_SELECTION"
 _NEXT_GATE_ENV = "VLLM_MOE_TRACE_NEXT_GATE"
+_NEXT_GATE_LORA_DIR_ENV = "VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR"
 
 ActivationMode = Literal["none", "input"]
 TokenSelection = Literal["all", "prefill_last"]
+NextGatePredictor = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 
 
 def _positive_int_env(name: str, value: int) -> int:
@@ -120,9 +122,7 @@ class MoETraceCollector:
         self,
         config: MoETraceConfig,
         layer_names: dict[int, str],
-        next_gate_predictors: dict[
-            int, tuple[int, Callable[[torch.Tensor], torch.Tensor]]
-        ]
+        next_gate_predictors: dict[int, tuple[int, NextGatePredictor]]
         | None = None,
         next_gate_missing_gate_layers: list[tuple[int, int]] | None = None,
         next_gate_diagnostics: list[dict[str, Any]] | None = None,
@@ -155,6 +155,7 @@ class MoETraceCollector:
             "token_selection": self.config.token_selection,
             "trace_next_gate": self.config.trace_next_gate,
             "trace_next_gate_env": os.getenv(_NEXT_GATE_ENV),
+            "next_gate_lora_dir": os.getenv(_NEXT_GATE_LORA_DIR_ENV),
             "next_gate_predictor_count": len(self.next_gate_predictors),
             "next_gate_predictor_pairs": [
                 [layer_id, next_layer_id]
@@ -232,6 +233,7 @@ class MoETraceCollector:
         self,
         layer_id: int,
         hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> None:
@@ -241,7 +243,10 @@ class MoETraceCollector:
         self._seen_layers.add(layer_id)
 
         available_tokens = min(
-            hidden_states.shape[0], topk_weights.shape[0], topk_ids.shape[0]
+            hidden_states.shape[0],
+            router_logits.shape[0],
+            topk_weights.shape[0],
+            topk_ids.shape[0],
         )
         selected_indices = self._selected_token_indices
         selected_phases = self._selected_token_phases
@@ -290,6 +295,7 @@ class MoETraceCollector:
         )
 
         selected_hidden_states = hidden_states.index_select(0, index_tensor)
+        selected_router_logits = router_logits.index_select(0, index_tensor)
         record: dict[str, Any] = {
             "format_version": 1,
             "rank": self.rank,
@@ -302,6 +308,9 @@ class MoETraceCollector:
             "selected_token_end": token_end,
             "selected_token_indices": torch.tensor(indices, dtype=torch.int64),
             "token_phases": torch.tensor(token_phases, dtype=torch.int8),
+            "router_logits": selected_router_logits.to(
+                device="cpu", dtype=self.config.activation_dtype
+            ),
             "topk_ids": topk_ids.index_select(0, index_tensor).to(
                 device="cpu", dtype=torch.int32
             ),
@@ -315,8 +324,13 @@ class MoETraceCollector:
             )
         if self.config.trace_next_gate and layer_id in self.next_gate_predictors:
             next_layer_id, predict_next_gate = self.next_gate_predictors[layer_id]
-            predicted_topk_ids = predict_next_gate(selected_hidden_states)
+            predicted_topk_ids, base_logits = predict_next_gate(
+                selected_hidden_states
+            )
             record["next_gate_layer_id"] = next_layer_id
+            record["next_gate_base_logits"] = base_logits.to(
+                device="cpu", dtype=self.config.activation_dtype
+            )
             record["next_gate_predicted_topk_ids"] = predicted_topk_ids.to(
                 device="cpu", dtype=torch.int32
             )
@@ -470,6 +484,51 @@ def maybe_attach_moe_trace(
 
         return None, ""
 
+    def _load_lora_for_pair(
+        source_layer_id: int,
+        next_layer_id: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor | float] | None:
+        lora_dir = os.getenv(_NEXT_GATE_LORA_DIR_ENV)
+        if not lora_dir:
+            return None
+        root = Path(lora_dir).expanduser()
+        candidates = [
+            root / f"layer_{source_layer_id:04d}_to_{next_layer_id:04d}.pt",
+            root / f"layer_{next_layer_id:04d}.pt",
+        ]
+        path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if path is None:
+            logger.warning(
+                "%s=%s has no LoRA file for layer %d -> %d",
+                _NEXT_GATE_LORA_DIR_ENV,
+                root,
+                source_layer_id,
+                next_layer_id,
+            )
+            return None
+        payload = torch.load(path, map_location=device, weights_only=True)
+        lora_a = payload["lora_A"].to(device=device, dtype=dtype)
+        lora_b = payload["lora_B"].to(device=device, dtype=dtype)
+        rank = int(payload.get("rank", lora_a.shape[0]))
+        alpha = float(payload.get("alpha", rank))
+        logger.warning(
+            "%s loaded next-gate LoRA for layer %d -> %d from %s "
+            "(rank=%d, alpha=%s)",
+            _NEXT_GATE_LORA_DIR_ENV,
+            source_layer_id,
+            next_layer_id,
+            path,
+            rank,
+            alpha,
+        )
+        return {
+            "lora_A": lora_a,
+            "lora_B": lora_b,
+            "scale": alpha / rank,
+        }
+
     layer_names = {module.layer_id: name for name, module in layers}
     next_gate_predictors = {}
     next_gate_missing_gate_layers = []
@@ -526,6 +585,13 @@ def maybe_attach_moe_trace(
                     (module.layer_id, next_module.layer_id)
                 )
                 continue
+            reference_param = next(next_module.parameters())
+            lora_payload = _load_lora_for_pair(
+                module.layer_id,
+                next_module.layer_id,
+                reference_param.device,
+                reference_param.dtype,
+            )
             logger.warning(
                 "%s using gate for layer %d -> %d from %s; "
                 "next_layer_name=%s runner_gate=%s",
@@ -542,8 +608,19 @@ def maybe_attach_moe_trace(
                 hidden_states,
                 _next_module=next_module,
                 _gate_projector=gate_projector,
+                _lora_payload=lora_payload,
             ):
-                router_logits = _gate_projector(hidden_states)
+                base_router_logits = _gate_projector(hidden_states)
+                router_logits = base_router_logits
+                if _lora_payload is not None:
+                    lora_a = _lora_payload["lora_A"]
+                    lora_b = _lora_payload["lora_B"]
+                    scale = _lora_payload["scale"]
+                    lora_input = hidden_states.to(lora_a.dtype)
+                    lora_logits = (lora_input @ lora_a.T) @ lora_b.T
+                    router_logits = router_logits + lora_logits.to(
+                        router_logits.dtype
+                    ) * scale
                 router = _next_module.router
                 _, topk_ids = router._compute_routing(
                     hidden_states,
@@ -551,7 +628,7 @@ def maybe_attach_moe_trace(
                     router._get_indices_type(),
                     input_ids=None,
                 )
-                return topk_ids
+                return topk_ids, base_router_logits
 
             next_gate_predictors[module.layer_id] = (
                 next_module.layer_id,
@@ -582,8 +659,20 @@ def maybe_attach_moe_trace(
     for _, module in layers:
         layer_id = module.layer_id
 
-        def _trace_fn(hidden_states, topk_weights, topk_ids, _layer_id=layer_id):
-            collector.capture(_layer_id, hidden_states, topk_weights, topk_ids)
+        def _trace_fn(
+            hidden_states,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            _layer_id=layer_id,
+        ):
+            collector.capture(
+                _layer_id,
+                hidden_states,
+                router_logits,
+                topk_weights,
+                topk_ids,
+            )
 
         module.router.set_trace_fn(_trace_fn)
 

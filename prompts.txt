@@ -1,0 +1,85 @@
+Explain why the sky appears blue during the day and red near sunset, using Rayleigh scattering but avoiding unnecessary equations.
+Compare nuclear fission and nuclear fusion in terms of physical mechanism, fuel, waste, safety, and present-day engineering feasibility.
+Describe how CRISPR-Cas9 edits DNA, then identify two scientific limitations and two ethical concerns associated with its use.
+Explain the difference between classical bits and quantum bits to a software engineer who has never studied quantum mechanics.
+Why does increasing atmospheric carbon dioxide warm Earth? Distinguish the greenhouse effect from ozone depletion.
+Design a controlled experiment to test whether a new fertilizer improves tomato yield while accounting for soil quality and weather.
+Prove that there are infinitely many prime numbers, and explain the key contradiction in plain language.
+Solve the recurrence T(n) = 2T(n/2) + n log n and state its asymptotic complexity with justification.
+A fair coin is tossed until two consecutive heads appear. Derive the expected number of tosses rather than only stating the answer.
+Explain why gradient descent can converge slowly in a narrow curved loss valley and how momentum changes the optimization dynamics.
+Given a matrix A, explain the geometric meaning of its eigenvectors and eigenvalues and provide a concrete two-dimensional example.
+Estimate how many piano tuners work in Shanghai using a Fermi calculation, clearly stating every assumption.
+Write a Python function that merges overlapping time intervals in O(n log n) time and include tests for nested and touching intervals.
+Implement an LRU cache in Python without using functools, and explain why both lookup and update are O(1).
+Review this concurrency design: multiple producers append work to a shared list while one consumer polls it without locks. Identify failure modes and propose a safe alternative.
+Explain the difference between TCP flow control and congestion control, including what problem each mechanism prevents.
+Design a database schema for a multi-tenant issue tracker with projects, users, comments, labels, and audit history; discuss the essential indexes.
+Show how to detect a cycle in a directed graph using depth-first search, and contrast it with Kahn's topological-sort approach.
+Diagnose a web service whose median latency is stable but P99 latency doubles under moderate load; propose a measurement plan before suggesting fixes.
+Explain when a Bloom filter is useful, derive the source of false positives, and describe how its parameters affect memory usage.
+Write a SQL query that returns each department's three highest-paid employees, correctly handling ties with a window function.
+Create a minimal PyTorch training loop with gradient accumulation, mixed precision, gradient clipping, and a learning-rate scheduler.
+Compare process parallelism, thread parallelism, and asynchronous I/O for a Python service that performs both network requests and CPU-heavy parsing.
+Find the bug conceptually: a distributed training job hangs only when one rank receives an empty batch, while all collective calls appear correct on normal batches.
+Summarize the main economic causes of inflation and explain why a single observed price increase is not by itself evidence of economy-wide inflation.
+Compare gross domestic product, gross national income, and median household income as measures of economic welfare, including their blind spots.
+Explain how compound interest works and calculate the future value of a monthly investment of 500 dollars for ten years at a hypothetical annual return of six percent.
+Analyze the trade-offs between fixed-rate and adjustable-rate mortgages without giving personalized financial advice.
+Explain how a central bank can influence short-term interest rates and why its actions may affect unemployment and inflation with a delay.
+Design a simple auction mechanism for allocating cloud GPU time among internal teams, and discuss incentives and possible gaming.
+Translate the following engineering requirement into testable acceptance criteria: the system should be fast, reliable, and easy to use.
+Rewrite a vague project update into a concise executive summary with risks, decisions needed, and next milestones.
+Create a rubric for evaluating whether an AI coding assistant's answer is correct, safe, maintainable, and easy to review.
+Explain how to read a systems paper critically, separating algorithmic novelty from implementation choices and hardware-specific optimizations.
+Compare prefix caching, speculative decoding, and continuous batching in LLM inference, explaining the bottleneck each technique addresses.
+Explain expert parallelism in mixture-of-experts models, including token routing, all-to-all communication, load imbalance, and tail latency.
+Design an experiment to measure whether adjacent MoE layers have predictable routing patterns, including metrics, baselines, and ablations.
+Why can optimizing average token load per GPU fail to reduce P99 latency in MoE inference? Propose a better cost model.
+Explain the difference between tensor parallelism, pipeline parallelism, data parallelism, and expert parallelism for large language model inference.
+Given a batch of token-to-expert assignments, propose a method to detect whether routing is skewed and whether the skew is stable across layers.
+Describe how LoRA modifies a frozen linear layer, why it reduces trainable parameters, and when it may fail to capture the needed update.
+Explain the difference between top-k accuracy, set overlap, Jaccard similarity, and cosine similarity for comparing expert routing decisions.
+Propose a training objective for predicting the next MoE layer's top-k experts from the current layer's activation, and discuss class imbalance.
+Explain why using dummy weights can make MoE routing experiments misleading even if the software pipeline appears to run correctly.
+Debug this scenario: a trace file contains predicted top-k expert IDs but the plotting script reports that no predictions were found.
+Explain why reading environment variables through a cached helper can cause a worker process to ignore a flag set later by the parent process.
+Compare saving one tensor file per layer per step with packing all records into shard files, including trade-offs for debugging and training speed.
+请用通俗但准确的语言解释混合专家模型中的路由、Top-k expert 选择、负载不均衡和 All-to-All 通信之间的关系。
+比较前缀缓存、投机解码和连续批处理三种大模型推理优化技术，说明它们分别改善什么瓶颈以及可能引入的代价。
+设计一个实验，判断相邻 MoE 层的路由分布是否具有可预测性，并明确训练集划分、评价指标、基线和消融实验。
+解释为什么只优化各个 GPU 的平均 token 数量可能无法降低 MoE 推理的 P99 延迟，并给出一个更合理的联合代价函数。
+将“这个方案应该会更快”改写成一段可验证的工程假设，包含目标指标、对照组、硬件条件和失败判据。
+阅读一个模型系统论文时，如何区分算法收益、实现优化和硬件特化带来的性能提升？请给出一套审查步骤。
+解释 LoRA 中低秩矩阵 A 和 B 的作用，并说明为什么它可以在冻结原始权重的情况下学习一个有效的增量。
+给定一个线上推荐系统，如何设计 A/B 测试来判断新的召回模型是否真正提升了长期用户价值？
+请解释数据库事务中的原子性、一致性、隔离性和持久性，并举例说明隔离级别过低会出现什么问题。
+设计一个限流器，支持每个用户每分钟最多 100 次请求，同时允许短时间突发流量；说明数据结构和边界情况。
+请用 Python 写一个拓扑排序函数，并解释如何在有环图上返回清晰的错误信息。
+分析一个缓存命中率很高但尾延迟仍然很差的服务，给出可能原因和排查顺序。
+解释 Transformer 中 attention mask 的作用，并说明 causal mask 和 padding mask 有什么区别。
+比较 beam search、top-k sampling、top-p sampling 和 greedy decoding 的行为差异以及适用场景。
+请说明为什么 batch size 增大可能提升吞吐但恶化延迟，并结合 GPU kernel launch 和排队时间解释。
+设计一个日志采样方案，在不丢失关键错误的前提下降低日志量，并说明如何验证它没有隐藏线上问题。
+解释什么是反压机制，为什么没有反压的消息队列系统可能在下游变慢时崩溃。
+给出一个排查 GPU 显存泄漏的计划，包括监控指标、最小复现和可能的代码层原因。
+说明为什么同一个模型在 eager mode 和 graph/cudagraph mode 下的调试方式不同。
+请解释 softmax 的数值稳定性问题，并写出稳定版 softmax 的伪代码。
+比较监督微调、偏好优化和强化学习在人类反馈对齐中的作用和风险。
+如果一个模型在训练集上路由预测准确率很高但验证集很低，列出可能的过拟合原因和改进方法。
+请解释为什么多 GPU 训练中的 collective 操作需要所有 rank 以一致顺序调用。
+设计一个用于检查 MoE 路由 trace 是否可信的 sanity check 列表，包括权重加载、token 对齐和层号匹配。
+把一个复杂系统拆成三个层次：用户可见行为、服务端调度逻辑、底层硬件执行，并说明每层应该观测什么指标。
+请写一段简短但有说服力的技术方案说明，主题是“为什么要把大量小 trace 文件打包成 shard 文件”。
+解释在训练 next-layer expert predictor 时，为什么使用当前层 activation 预测下一层 gate 可能有信息缺失。
+请比较 BCE 多标签损失和交叉熵损失在训练 top-k expert 预测器时的差异。
+分析一个模型推理服务在低 QPS 下正常、高 QPS 下偶发超时的原因，并给出实验验证方案。
+请用中文解释什么是 CUDA kernel JIT 编译，以及为什么它会造成第一次请求的延迟尖峰。
+设计一个工具，读取 MoE trace 并输出每层 expert load 的热力图、相邻层 overlap 和异常提示。
+请解释为什么保存 base logits 对训练 gate+LoRA 很重要，而只保存 predicted top-k 不够。
+给出一个判断 LoRA rank 是否足够的实验方案，包括 rank sweep、验证集指标和过拟合检查。
+请说明如何把 ShareGPT 对话数据转换成一行一个 prompt 的训练输入，并讨论是否应该保留 assistant 回复。
+Explain how to convert a multi-turn chat dataset into prompts for offline inference while preserving speaker roles and avoiding data leakage.
+Design a small benchmark to compare packed trace loading against thousands of individual tensor files in terms of wall time and filesystem overhead.
+Explain why evaluating expert prediction only on generated decode tokens may give a different conclusion from evaluating all prompt tokens.
+Given a set of per-layer LoRA adapters, propose a deployment plan that uses them only for auxiliary prediction and never changes the model's normal forward pass.

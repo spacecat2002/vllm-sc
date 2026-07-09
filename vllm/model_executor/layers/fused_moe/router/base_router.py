@@ -172,7 +172,11 @@ class BaseRouter(FusedMoERouter):
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
         self.trace_fn: (
-            Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None
+            Callable[
+                [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                None,
+            ]
+            | None
         ) = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
@@ -181,7 +185,11 @@ class BaseRouter(FusedMoERouter):
 
     def set_trace_fn(
         self,
-        trace_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None,
+        trace_fn: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            None,
+        ]
+        | None,
     ) -> None:
         """Set a research callback for router inputs and logical routing.
 
@@ -304,7 +312,7 @@ class BaseRouter(FusedMoERouter):
             self.capture_fn(topk_ids)
 
         if self.trace_fn is not None:
-            self.trace_fn(hidden_states, topk_weights, topk_ids)
+            self.trace_fn(hidden_states, router_logits, topk_weights, topk_ids)
 
         # Step 4: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

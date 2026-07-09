@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     ] = "float16"
     VLLM_MOE_TRACE_TOKEN_SELECTION: Literal["all", "prefill_last"] = "all"
     VLLM_MOE_TRACE_NEXT_GATE: bool = False
+    VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -845,6 +846,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_MOE_TRACE_NEXT_GATE", "0", ["0", "1"]
     )
     == "1",
+    "VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR": lambda: os.getenv(
+        "VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR"
+    ),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
@@ -2163,6 +2167,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MOE_TRACE_ACTIVATION_DTYPE",
         "VLLM_MOE_TRACE_TOKEN_SELECTION",
         "VLLM_MOE_TRACE_NEXT_GATE",
+        "VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

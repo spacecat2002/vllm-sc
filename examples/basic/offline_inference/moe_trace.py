@@ -97,6 +97,12 @@ def _collect_dp_rank(
     # Request-level routed-expert capture is not supported by Model Runner V2.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     os.environ["VLLM_MOE_TRACE_NEXT_GATE"] = "1" if args.trace_next_gate else "0"
+    if args.next_gate_lora_dir is not None:
+        os.environ["VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR"] = str(
+            args.next_gate_lora_dir.resolve()
+        )
+    else:
+        os.environ.pop("VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR", None)
 
     from vllm import LLM, SamplingParams
 
@@ -224,12 +230,15 @@ def _check_next_gate_trace(output_dir: Path) -> None:
             "next_gate_diagnostics."
         )
 
-    record_paths = sorted(activation_dir.glob("rank_*/step_*_layer_*.pt"))
-    if not record_paths:
-        raise RuntimeError(f"No .pt activation records found under {activation_dir}")
+    records = []
+    for rank_dir in sorted(activation_dir.glob("rank_*")):
+        records.extend(_iter_activation_records(rank_dir, torch))
+        if len(records) >= 32:
+            break
+    if not records:
+        raise RuntimeError(f"No activation records found under {activation_dir}")
 
-    for record_path in record_paths[: min(len(record_paths), 32)]:
-        record = torch.load(record_path, map_location="cpu", weights_only=True)
+    for record in records[: min(len(records), 32)]:
         if "next_gate_predicted_topk_ids" in record:
             return
 
@@ -238,6 +247,85 @@ def _check_next_gate_trace(output_dir: Path) -> None:
         "contain next_gate_predicted_topk_ids. Check whether only final-layer "
         "records were sampled or inspect all activation records."
     )
+
+
+def _packed_activation_paths(rank_dir: Path) -> list[Path]:
+    return sorted(rank_dir.glob("records_*.pt"))
+
+
+def _iter_activation_records(
+    rank_dir: Path,
+    torch_module: Any,
+) -> list[dict[str, Any]]:
+    packed_paths = _packed_activation_paths(rank_dir)
+    if packed_paths:
+        records = []
+        for path in packed_paths:
+            payload = torch_module.load(
+                path, map_location="cpu", weights_only=True
+            )
+            records.extend(payload["records"])
+        return records
+
+    records = []
+    for path in sorted(rank_dir.glob("step_*_layer_*.pt")):
+        records.append(
+            torch_module.load(path, map_location="cpu", weights_only=True)
+        )
+    return records
+
+
+def _load_activation_records(
+    activation_root: Path,
+    rank: int | None,
+    torch_module: Any,
+) -> dict[tuple[int, int, int], dict[str, Any]]:
+    if rank is None:
+        rank_dirs = sorted(activation_root.glob("rank_*"))
+    else:
+        rank_dirs = [activation_root / f"rank_{rank:05d}"]
+
+    records: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for rank_dir in rank_dirs:
+        if not rank_dir.exists():
+            continue
+        rank_id = int(rank_dir.name.removeprefix("rank_"))
+        for record in _iter_activation_records(rank_dir, torch_module):
+            key = (rank_id, int(record["step"]), int(record["layer_id"]))
+            records[key] = record
+    return records
+
+
+def _pack_activation_records(
+    activation_root: Path,
+    *,
+    delete_unpacked: bool,
+) -> None:
+    import torch
+
+    for rank_dir in sorted(activation_root.glob("rank_*")):
+        record_paths = sorted(rank_dir.glob("step_*_layer_*.pt"))
+        if not record_paths:
+            continue
+        records = [
+            torch.load(path, map_location="cpu", weights_only=True)
+            for path in record_paths
+        ]
+        rank_id = int(rank_dir.name.removeprefix("rank_"))
+        packed_path = rank_dir / f"records_rank_{rank_id:05d}.pt"
+        torch.save(
+            {
+                "format_version": 1,
+                "rank": rank_id,
+                "num_records": len(records),
+                "records": records,
+            },
+            packed_path,
+        )
+        if delete_unpacked:
+            for path in record_paths:
+                path.unlink()
+        print(f"Packed {len(records)} records into {packed_path}")
 
 
 def collect(args: argparse.Namespace) -> None:
@@ -269,6 +357,12 @@ def collect(args: argparse.Namespace) -> None:
     os.environ["VLLM_MOE_TRACE_ACTIVATION_DTYPE"] = args.activation_dtype
     os.environ["VLLM_MOE_TRACE_TOKEN_SELECTION"] = "prefill_last"
     os.environ["VLLM_MOE_TRACE_NEXT_GATE"] = "1" if args.trace_next_gate else "0"
+    if args.next_gate_lora_dir is not None:
+        os.environ["VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR"] = str(
+            args.next_gate_lora_dir.resolve()
+        )
+    else:
+        os.environ.pop("VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR", None)
 
     from multiprocessing import Process
 
@@ -334,6 +428,9 @@ def collect(args: argparse.Namespace) -> None:
             "last prompt token for prefill; each token for decode"
         ),
         "trace_next_gate": args.trace_next_gate,
+        "next_gate_lora_dir": str(args.next_gate_lora_dir)
+        if args.next_gate_lora_dir is not None
+        else None,
         "moe_backend": args.moe_backend,
     }
     (output_dir / "metadata.json").write_text(
@@ -360,6 +457,11 @@ def collect(args: argparse.Namespace) -> None:
     #     )
     if args.trace_next_gate:
         _check_next_gate_trace(output_dir)
+    if args.pack_activations:
+        _pack_activation_records(
+            activation_dir,
+            delete_unpacked=args.delete_unpacked_activations,
+        )
     print(f"Saved routes and activations under {output_dir}")
 
 
@@ -771,20 +873,7 @@ def _load_next_gate_overlap_rows(
     import torch
 
     activation_root = trace_dir / "activations"
-    if rank is None:
-        rank_dirs = sorted(activation_root.glob("rank_*"))
-    else:
-        rank_dirs = [activation_root / f"rank_{rank:05d}"]
-
-    records: dict[tuple[int, int, int], dict[str, Any]] = {}
-    for rank_dir in rank_dirs:
-        if not rank_dir.exists():
-            continue
-        rank_id = int(rank_dir.name.removeprefix("rank_"))
-        for path in sorted(rank_dir.glob("step_*_layer_*.pt")):
-            record = torch.load(path, map_location="cpu", weights_only=True)
-            key = (rank_id, int(record["step"]), int(record["layer_id"]))
-            records[key] = record
+    records = _load_activation_records(activation_root, rank, torch)
     if not records:
         raise ValueError(f"No activation records found under {activation_root}")
 
@@ -942,6 +1031,393 @@ def plot_next_gate_similarity(args: argparse.Namespace) -> None:
     print(f"Saved {output} and matching .csv/.json/.npz data")
 
 
+def _multihot_topk(
+    topk_ids: "torch.Tensor",
+    num_experts: int,
+    device: "torch.device",
+) -> "torch.Tensor":
+    import torch
+
+    target = torch.zeros(
+        (topk_ids.shape[0], num_experts),
+        device=device,
+        dtype=torch.float32,
+    )
+    safe_ids = topk_ids.clamp(min=0, max=num_experts - 1)
+    return target.scatter_(1, safe_ids, 1.0)
+
+
+def _topk_overlap_from_logits(
+    logits: "torch.Tensor",
+    labels: "torch.Tensor",
+    top_k: int,
+    num_experts: int,
+) -> float:
+    import torch
+
+    predicted = torch.topk(logits, k=top_k, dim=-1).indices
+    pred_hot = _multihot_topk(predicted, num_experts, logits.device)
+    label_hot = _multihot_topk(labels, num_experts, logits.device)
+    overlap = (pred_hot * label_hot).sum(dim=-1) / top_k
+    return float(overlap.mean().item())
+
+
+def _load_next_gate_lora_training_data(
+    trace_dir: Path,
+    rank: int | None,
+    num_experts: int,
+    phase: str,
+    max_examples_per_layer: int | None,
+) -> dict[int, dict[str, Any]]:
+    import torch
+
+    activation_root = trace_dir / "activations"
+    records = _load_activation_records(activation_root, rank, torch)
+    if not records:
+        raise ValueError(f"No activation records found under {activation_root}")
+
+    chunks: dict[int, dict[str, Any]] = {}
+    for (rank_id, step, layer_id), record in sorted(records.items()):
+        if "next_gate_predicted_topk_ids" not in record:
+            continue
+        if "activations" not in record:
+            raise ValueError("LoRA training requires activation records")
+        if "next_gate_base_logits" not in record:
+            raise ValueError(
+                "LoRA training requires next_gate_base_logits. Re-run collect "
+                "with --trace-next-gate after this change."
+            )
+        next_layer_id = int(record["next_gate_layer_id"])
+        next_record = records.get((rank_id, step, next_layer_id))
+        if next_record is None:
+            continue
+        if "router_logits" not in next_record:
+            raise ValueError(
+                "LoRA logits-target training requires router_logits in the "
+                "next-layer record. Re-run collect after this change."
+            )
+
+        activations = record["activations"]
+        base_logits = record["next_gate_base_logits"]
+        target_logits = next_record["router_logits"]
+        labels = next_record["topk_ids"]
+        mask = _phase_mask(record, phase)
+        if mask is not None:
+            activations = activations[mask]
+            base_logits = base_logits[mask]
+            target_logits = target_logits[mask]
+            labels = labels[mask]
+        if activations.shape[0] == 0:
+            continue
+
+        entry = chunks.setdefault(
+            next_layer_id,
+            {
+                "source_layer_id": layer_id,
+                "next_layer_id": next_layer_id,
+                "activations": [],
+                "base_logits": [],
+                "target_logits": [],
+                "labels": [],
+                "count": 0,
+            },
+        )
+        remaining = None
+        if max_examples_per_layer is not None:
+            remaining = max_examples_per_layer - int(entry["count"])
+            if remaining <= 0:
+                continue
+            activations = activations[:remaining]
+            base_logits = base_logits[:remaining]
+            target_logits = target_logits[:remaining]
+            labels = labels[:remaining]
+
+        entry["activations"].append(activations.to(torch.float32))
+        entry["base_logits"].append(base_logits.to(torch.float32))
+        entry["target_logits"].append(target_logits.to(torch.float32))
+        entry["labels"].append(labels.to(torch.long).clamp(0, num_experts - 1))
+        entry["count"] = int(entry["count"]) + int(activations.shape[0])
+
+    datasets: dict[int, dict[str, Any]] = {}
+    for next_layer_id, entry in chunks.items():
+        datasets[next_layer_id] = {
+            "source_layer_id": entry["source_layer_id"],
+            "next_layer_id": next_layer_id,
+            "activations": torch.cat(entry["activations"], dim=0),
+            "base_logits": torch.cat(entry["base_logits"], dim=0),
+            "target_logits": torch.cat(entry["target_logits"], dim=0),
+            "labels": torch.cat(entry["labels"], dim=0),
+        }
+    if not datasets:
+        raise ValueError("No next-gate LoRA training examples were found")
+    return datasets
+
+
+def train_next_gate_lora(args: argparse.Namespace) -> None:
+    import math
+    import torch
+
+    trace_dir = args.trace_dir.resolve()
+    metadata = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
+    num_experts = args.num_experts or int(metadata["num_experts"])
+    datasets = _load_next_gate_lora_training_data(
+        trace_dir,
+        args.rank,
+        num_experts,
+        args.phase,
+        args.max_examples_per_layer,
+    )
+
+    if args.device is not None:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    for next_layer_id, data in sorted(datasets.items()):
+        source_layer_id = int(data["source_layer_id"])
+        x = data["activations"].to(device=device)
+        base_logits = data["base_logits"].to(device=device)
+        target_logits = data["target_logits"].to(device=device)
+        labels = data["labels"].to(device=device)
+        num_examples, hidden_size = x.shape
+        num_experts = target_logits.shape[1]
+        top_k = labels.shape[1]
+        rank = min(args.rank_dim, hidden_size, num_experts)
+        scale = args.alpha / rank
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(args.seed + next_layer_id)
+        perm = torch.randperm(num_examples, generator=generator, device=device)
+        val_count = int(num_examples * args.val_fraction)
+        val_indices = perm[:val_count]
+        train_indices = perm[val_count:] if val_count else perm
+
+        lora_a = torch.nn.Parameter(
+            torch.empty((rank, hidden_size), device=device, dtype=torch.float32)
+        )
+        lora_b = torch.nn.Parameter(
+            torch.zeros((num_experts, rank), device=device, dtype=torch.float32)
+        )
+        torch.nn.init.kaiming_uniform_(lora_a, a=math.sqrt(5))
+        optimizer = torch.optim.AdamW(
+            [lora_a, lora_b],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        loss_fn = torch.nn.MSELoss()
+
+        for epoch in range(args.epochs):
+            order = train_indices[
+                torch.randperm(
+                    train_indices.numel(),
+                    generator=generator,
+                    device=device,
+                )
+            ]
+            total_loss = 0.0
+            total_seen = 0
+            for start in range(0, order.numel(), args.batch_size):
+                batch = order[start : start + args.batch_size]
+                batch_x = x[batch]
+                batch_base = base_logits[batch]
+                batch_target = target_logits[batch]
+                lora_logits = (batch_x @ lora_a.T) @ lora_b.T
+                logits = batch_base + lora_logits * scale
+                loss = loss_fn(logits, batch_target)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.item()) * batch.numel()
+                total_seen += int(batch.numel())
+
+            eval_indices = val_indices if val_count else train_indices
+            with torch.no_grad():
+                eval_logits = (
+                    base_logits[eval_indices]
+                    + ((x[eval_indices] @ lora_a.T) @ lora_b.T) * scale
+                )
+                eval_loss = loss_fn(
+                    eval_logits,
+                    target_logits[eval_indices],
+                )
+                eval_overlap = _topk_overlap_from_logits(
+                    eval_logits,
+                    labels[eval_indices],
+                    top_k,
+                    num_experts,
+                )
+            if args.verbose:
+                mean_loss = total_loss / max(total_seen, 1)
+                print(
+                    f"layer {source_layer_id}->{next_layer_id} "
+                    f"epoch {epoch + 1}/{args.epochs}: "
+                    f"loss={mean_loss:.6f}, val_mse={eval_loss.item():.6f}, "
+                    f"topk_overlap={eval_overlap:.4f}"
+                )
+
+        path = output_dir / (
+            f"layer_{source_layer_id:04d}_to_{next_layer_id:04d}.pt"
+        )
+        torch.save(
+            {
+                "source_layer_id": source_layer_id,
+                "next_layer_id": next_layer_id,
+                "rank": rank,
+                "alpha": float(args.alpha),
+                "hidden_size": hidden_size,
+                "num_experts": num_experts,
+                "lora_A": lora_a.detach().cpu(),
+                "lora_B": lora_b.detach().cpu(),
+            },
+            path,
+        )
+        results.append(
+            {
+                "source_layer_id": source_layer_id,
+                "next_layer_id": next_layer_id,
+                "num_examples": num_examples,
+                "rank": rank,
+                "alpha": args.alpha,
+                "eval_mse": float(eval_loss.item()),
+                "eval_overlap": eval_overlap,
+                "path": str(path),
+            }
+        )
+        print(
+            f"Saved {path} "
+            f"(examples={num_examples}, eval_mse={eval_loss.item():.6f}, "
+            f"eval_overlap={eval_overlap:.4f})"
+        )
+
+    (output_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "trace_dir": str(trace_dir),
+                "phase": args.phase,
+                "num_experts": num_experts,
+                "rank_dim": args.rank_dim,
+                "alpha": args.alpha,
+                "lr": args.lr,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "target": "next_layer_router_logits",
+                "loss": "mse",
+                "results": results,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def run_next_gate_lora_pipeline(args: argparse.Namespace) -> None:
+    work_dir = args.work_dir.resolve()
+    train_trace_dir = work_dir / "train_trace"
+    lora_dir = work_dir / "lora"
+    eval_trace_dir = work_dir / "eval_trace"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    train_prompts = args.prompts
+    eval_prompts = args.eval_prompts or args.prompts
+
+    common_collect = {
+        "model": args.model,
+        "ep_size": args.ep_size,
+        "max_model_len": args.max_model_len,
+        "max_new_tokens": args.max_new_tokens,
+        "max_tokens_per_sample": args.max_tokens_per_sample,
+        "timeout": args.timeout,
+        "activation_dtype": args.activation_dtype,
+        "trace_next_gate": True,
+        "load_format": args.load_format,
+        "moe_backend": args.moe_backend,
+        "pack_activations": args.pack_activations,
+        "delete_unpacked_activations": args.delete_unpacked_activations,
+    }
+
+    print(f"[1/4] Collecting training trace under {train_trace_dir}")
+    collect(
+        argparse.Namespace(
+            **common_collect,
+            prompts=train_prompts,
+            output_dir=train_trace_dir,
+            next_gate_lora_dir=None,
+        )
+    )
+
+    print(f"[2/4] Training next-gate LoRA adapters under {lora_dir}")
+    train_next_gate_lora(
+        argparse.Namespace(
+            trace_dir=train_trace_dir,
+            output_dir=lora_dir,
+            rank=args.train_rank,
+            num_experts=args.num_experts,
+            phase=args.train_phase,
+            rank_dim=args.rank_dim,
+            alpha=args.alpha,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            val_fraction=args.val_fraction,
+            seed=args.seed,
+            device=args.device,
+            max_examples_per_layer=args.max_examples_per_layer,
+            verbose=args.verbose,
+        )
+    )
+
+    print(f"[3/4] Collecting LoRA eval trace under {eval_trace_dir}")
+    collect(
+        argparse.Namespace(
+            **common_collect,
+            prompts=eval_prompts,
+            output_dir=eval_trace_dir,
+            next_gate_lora_dir=lora_dir,
+        )
+    )
+
+    print("[4/4] Writing baseline and LoRA eval plots/data")
+    baseline_output = work_dir / f"baseline_next_gate_similarity_{args.eval_phase}.png"
+    lora_output = work_dir / f"lora_next_gate_similarity_{args.eval_phase}.png"
+    plot_next_gate_similarity(
+        argparse.Namespace(
+            trace_dir=train_trace_dir,
+            rank=args.eval_rank,
+            num_experts=args.num_experts,
+            phase=args.eval_phase,
+            output=baseline_output,
+        )
+    )
+    plot_next_gate_similarity(
+        argparse.Namespace(
+            trace_dir=eval_trace_dir,
+            rank=args.eval_rank,
+            num_experts=args.num_experts,
+            phase=args.eval_phase,
+            output=lora_output,
+        )
+    )
+
+    summary = {
+        "model": args.model,
+        "train_trace_dir": str(train_trace_dir),
+        "lora_dir": str(lora_dir),
+        "eval_trace_dir": str(eval_trace_dir),
+        "baseline_plot": str(baseline_output),
+        "lora_plot": str(lora_output),
+        "train_prompts": str(train_prompts) if train_prompts is not None else None,
+        "eval_prompts": str(eval_prompts) if eval_prompts is not None else None,
+    }
+    (work_dir / "pipeline_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    print(f"Pipeline complete. Summary: {work_dir / 'pipeline_summary.json'}")
+
+
 def _load_activations(
     trace_dir: Path,
     rank: int | None,
@@ -951,31 +1427,24 @@ def _load_activations(
     import torch
 
     activation_root = trace_dir / "activations"
-    if rank is None:
-        rank_dirs = sorted(activation_root.glob("rank_*"))
-    else:
-        rank_dirs = [activation_root / f"rank_{rank:05d}"]
+    loaded_records = _load_activation_records(activation_root, rank, torch)
 
     records: dict[tuple[int, int, int], torch.Tensor] = {}
-    for rank_dir in rank_dirs:
-        rank_id = int(rank_dir.name.removeprefix("rank_"))
-        for path in sorted(rank_dir.glob("step_*_layer_*.pt")):
-            record = torch.load(path, map_location="cpu", weights_only=True)
-            if "activations" not in record:
+    for key, record in loaded_records.items():
+        if "activations" not in record:
+            continue
+        activations = record["activations"]
+        record_phase = record.get("phase", "all")
+        if phase != "all":
+            token_phases = record.get("token_phases")
+            if token_phases is not None:
+                phase_code = 0 if phase == "prefill" else 1
+                activations = activations[token_phases == phase_code]
+            elif record_phase != phase:
                 continue
-            activations = record["activations"]
-            record_phase = record.get("phase", "all")
-            if phase != "all":
-                token_phases = record.get("token_phases")
-                if token_phases is not None:
-                    phase_code = 0 if phase == "prefill" else 1
-                    activations = activations[token_phases == phase_code]
-                elif record_phase != phase:
-                    continue
-            if activations.shape[0] == 0:
-                continue
-            key = (rank_id, int(record["step"]), int(record["layer_id"]))
-            records[key] = activations
+        if activations.shape[0] == 0:
+            continue
+        records[key] = activations
     if not records:
         rank_label = "all ranks" if rank is None else f"rank {rank}"
         raise ValueError(f"No activation records found for {rank_label}")
@@ -1142,6 +1611,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     collect_parser.add_argument(
+        "--next-gate-lora-dir",
+        type=Path,
+        help=(
+            "Directory containing LoRA adapters produced by "
+            "train-next-gate-lora. The adapters are used only for trace "
+            "next-gate prediction, not for normal MoE inference."
+        ),
+    )
+    collect_parser.add_argument(
         "--load-format",
         default="auto",
         help=(
@@ -1154,6 +1632,16 @@ def parse_args() -> argparse.Namespace:
         choices=MOE_BACKEND_CHOICES,
         default="auto",
         help="MoE expert-kernel backend to pass to vLLM, e.g. triton.",
+    )
+    collect_parser.add_argument(
+        "--pack-activations",
+        action="store_true",
+        help="Pack per-step activation .pt files into one shard per rank.",
+    )
+    collect_parser.add_argument(
+        "--delete-unpacked-activations",
+        action="store_true",
+        help="Delete per-step activation .pt files after packing.",
     )
     collect_parser.set_defaults(func=collect)
 
@@ -1194,6 +1682,112 @@ def parse_args() -> argparse.Namespace:
     )
     next_gate_parser.add_argument("--output", type=Path)
     next_gate_parser.set_defaults(func=plot_next_gate_similarity)
+
+    train_lora_parser = subparsers.add_parser("train-next-gate-lora")
+    train_lora_parser.add_argument("--trace-dir", type=Path, required=True)
+    train_lora_parser.add_argument("--output-dir", type=Path, required=True)
+    train_lora_parser.add_argument(
+        "--rank",
+        type=int,
+        help="Train from one EP rank; by default traces from all ranks are used.",
+    )
+    train_lora_parser.add_argument("--num-experts", type=int)
+    train_lora_parser.add_argument(
+        "--phase", choices=("prefill", "decode", "all"), default="all"
+    )
+    train_lora_parser.add_argument("--rank-dim", type=int, default=8)
+    train_lora_parser.add_argument("--alpha", type=float, default=16.0)
+    train_lora_parser.add_argument("--epochs", type=int, default=5)
+    train_lora_parser.add_argument("--batch-size", type=int, default=1024)
+    train_lora_parser.add_argument("--lr", type=float, default=1e-3)
+    train_lora_parser.add_argument("--weight-decay", type=float, default=0.0)
+    train_lora_parser.add_argument("--val-fraction", type=float, default=0.1)
+    train_lora_parser.add_argument("--seed", type=int, default=0)
+    train_lora_parser.add_argument("--device", help="Training device, e.g. cuda:0")
+    train_lora_parser.add_argument("--max-examples-per-layer", type=int)
+    train_lora_parser.add_argument("--verbose", action="store_true")
+    train_lora_parser.set_defaults(func=train_next_gate_lora)
+
+    pipeline_parser = subparsers.add_parser("run-next-gate-lora-pipeline")
+    pipeline_parser.add_argument("--model", required=True)
+    pipeline_parser.add_argument("--prompts", type=Path)
+    pipeline_parser.add_argument(
+        "--eval-prompts",
+        type=Path,
+        help="Optional held-out prompts for LoRA validation collection.",
+    )
+    pipeline_parser.add_argument("--work-dir", type=Path, required=True)
+    pipeline_parser.add_argument(
+        "--ep-size",
+        dest="ep_size",
+        type=int,
+        default=1,
+        help=(
+            "Number of expert-parallel ranks. The script uses TP=1, DP=N, "
+            "and enable_expert_parallel=True, so EP size is N."
+        ),
+    )
+    pipeline_parser.add_argument("--max-model-len", type=int, default=4096)
+    pipeline_parser.add_argument("--max-new-tokens", type=int, default=16)
+    pipeline_parser.add_argument("--max-tokens-per-sample", type=int, default=4096)
+    pipeline_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=1800,
+        help="Maximum seconds to wait for each offline DP rank.",
+    )
+    pipeline_parser.add_argument(
+        "--activation-dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float16",
+    )
+    pipeline_parser.add_argument("--load-format", default="auto")
+    pipeline_parser.add_argument(
+        "--moe-backend",
+        choices=MOE_BACKEND_CHOICES,
+        default="auto",
+    )
+    pipeline_parser.add_argument(
+        "--pack-activations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pack activation records into one shard per rank.",
+    )
+    pipeline_parser.add_argument(
+        "--delete-unpacked-activations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Delete per-step activation .pt files after packing.",
+    )
+    pipeline_parser.add_argument("--num-experts", type=int)
+    pipeline_parser.add_argument(
+        "--train-rank",
+        type=int,
+        help="Train from one EP rank; by default traces from all ranks are used.",
+    )
+    pipeline_parser.add_argument(
+        "--eval-rank",
+        type=int,
+        help="Plot one EP rank; by default traces from all ranks are merged.",
+    )
+    pipeline_parser.add_argument(
+        "--train-phase", choices=("prefill", "decode", "all"), default="all"
+    )
+    pipeline_parser.add_argument(
+        "--eval-phase", choices=("prefill", "decode", "all"), default="all"
+    )
+    pipeline_parser.add_argument("--rank-dim", type=int, default=8)
+    pipeline_parser.add_argument("--alpha", type=float, default=16.0)
+    pipeline_parser.add_argument("--epochs", type=int, default=5)
+    pipeline_parser.add_argument("--batch-size", type=int, default=1024)
+    pipeline_parser.add_argument("--lr", type=float, default=1e-3)
+    pipeline_parser.add_argument("--weight-decay", type=float, default=0.0)
+    pipeline_parser.add_argument("--val-fraction", type=float, default=0.1)
+    pipeline_parser.add_argument("--seed", type=int, default=0)
+    pipeline_parser.add_argument("--device", help="Training device, e.g. cuda:0")
+    pipeline_parser.add_argument("--max-examples-per-layer", type=int)
+    pipeline_parser.add_argument("--verbose", action="store_true")
+    pipeline_parser.set_defaults(func=run_next_gate_lora_pipeline)
 
     activation_parser = subparsers.add_parser("plot-activations")
     activation_parser.add_argument("--trace-dir", type=Path, required=True)
