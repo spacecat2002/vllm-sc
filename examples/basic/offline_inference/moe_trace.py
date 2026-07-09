@@ -364,17 +364,12 @@ def collect(args: argparse.Namespace) -> None:
     else:
         os.environ.pop("VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR", None)
 
-    from multiprocessing import Process
+    import multiprocessing as mp
 
-    from vllm.platforms import current_platform
     from vllm.utils.network_utils import get_open_port
 
-    if current_platform.is_rocm():
-        from multiprocessing import set_start_method
-
-        set_start_method("spawn", force=True)
-
     dp_master_port = get_open_port()
+    mp_context = mp.get_context("spawn")
     indexed_prompts = list(enumerate(prompts))
     floor = len(indexed_prompts) // args.ep_size
     remainder = len(indexed_prompts) % args.ep_size
@@ -382,12 +377,12 @@ def collect(args: argparse.Namespace) -> None:
     def shard_start(rank: int) -> int:
         return rank * floor + min(rank, remainder)
 
-    processes: list[Process] = []
+    processes: list[mp.Process] = []
     for global_dp_rank in range(args.ep_size):
         rank_prompts = indexed_prompts[
             shard_start(global_dp_rank) : shard_start(global_dp_rank + 1)
         ]
-        process = Process(
+        process = mp_context.Process(
             target=_collect_dp_rank,
             args=(args, rank_prompts, global_dp_rank, dp_master_port, shard_dir),
         )
