@@ -164,12 +164,15 @@ moe_ep_distribution_by_rank_skew.png
 moe_ep_distribution_by_local_share.png
 ```
 
-第一张图以 `rank_skew` 为横轴，每条线对应一个传入的 `local_share`；如果传入
-5 个 `local_share`，图中就有 5 条线。第二张图以 `local_share` 为横轴，每条线
-对应一个传入的 `rank_skew`；如果传入 5 个 `rank_skew`，图中同样有 5 条线。
+`by_local_share` 图中，每个传入的 `local_share` 对应一个子图，横轴为
+`rank_skew`。如果传入 5 个 `local_share`，大图中就包含 5 个子图。
 
-纵轴使用 CSV summary 中的 `mean_max_total_ms`，即同一 rank 上 dispatch、compute
-和 combine 的 stage 耗时之和。图中不绘制 end-to-end latency。
+`by_rank_skew` 图中，每个传入的 `rank_skew` 对应一个子图，横轴为
+`local_share`。如果传入 5 个 `rank_skew`，大图中同样包含 5 个子图。
+
+每个子图都有 dispatch、compute 和 combine 三条折线，纵轴分别使用 CSV
+summary 中的 `mean_max_dispatch_ms`、`mean_max_compute_ms` 和
+`mean_max_combine_ms`。图中不绘制 stage-sum 或 end-to-end latency。
 
 ## 结果解读
 
