@@ -151,21 +151,25 @@ trim 后的 sweep summary，主要用于绘图。
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib-cache \
 .venv/bin/python benchmarks/kernels/plot_moe_ep_distribution.py \
-  --input-jsonl results/data/moe_ep_distribution.jsonl \
+  --input-csv results/data/moe_ep_distribution.csv \
   --output-dir results/plots \
   --prefix moe_ep_distribution
 ```
 
 JSONL 和 CSV 数据保存在 `results/data/`，生成的 PNG 单独保存在
-`results/plots/`。绘图脚本为每个 `local_share × rank_skew` 参数组合生成一张
-PNG。例如 5 个 `local_share` 和 5 个 `rank_skew` 会生成 25 张图。文件名形如：
+`results/plots/`。绘图脚本生成两张汇总折线图：
 
 ```text
-moe_ep_distribution_local_0p5_skew_0p25.png
+moe_ep_distribution_by_rank_skew.png
+moe_ep_distribution_by_local_share.png
 ```
 
-每张图的横轴是 iteration，三条折线分别表示该参数组合下各次迭代的 dispatch、
-compute 和 combine 最大 rank 耗时。图中不绘制 end-to-end latency。
+第一张图以 `rank_skew` 为横轴，每条线对应一个传入的 `local_share`；如果传入
+5 个 `local_share`，图中就有 5 条线。第二张图以 `local_share` 为横轴，每条线
+对应一个传入的 `rank_skew`；如果传入 5 个 `rank_skew`，图中同样有 5 条线。
+
+纵轴使用 CSV summary 中的 `mean_max_total_ms`，即同一 rank 上 dispatch、compute
+和 combine 的 stage 耗时之和。图中不绘制 end-to-end latency。
 
 ## 结果解读
 
@@ -177,6 +181,5 @@ compute 和 combine 最大 rank 耗时。图中不绘制 end-to-end latency。
 然后观察 `mean_token_imbalance`、`mean_max_compute_ms` 和 stage-sum latency
 之间的关系。
 
-每张图使用 JSONL 中的 aggregate 记录：先对每次迭代取所有 rank 的最大 stage
-耗时，再按 iteration 绘制。CSV 中仍保留 trimmed summary，适合做额外的统计
-分析；JSONL 中也保留 end-to-end 指标，但绘图脚本不展示该指标。
+绘图使用 CSV 中经过 trim 的 summary。JSONL 仍保留逐 rank、逐 iteration 和
+end-to-end 指标，适合进一步分析，但绘图脚本不展示这些数据。
