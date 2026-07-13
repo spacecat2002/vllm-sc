@@ -858,6 +858,11 @@ def plot_experts(args: argparse.Namespace) -> None:
     colors = _categorical_expert_colors(num_experts)
     if args.columns <= 0:
         raise ValueError("--columns must be positive")
+    if args.max_steps is not None:
+        if args.max_steps <= 0:
+            raise ValueError("--max-steps must be positive")
+        if args.x_axis != "step":
+            raise ValueError("--max-steps requires --x-axis step")
 
     samples = None
     if args.x_axis == "sample":
@@ -881,6 +886,9 @@ def plot_experts(args: argparse.Namespace) -> None:
                 num_experts,
                 args.phase,
             )
+            if args.max_steps is not None:
+                x = x[: args.max_steps]
+                shares = shares[: args.max_steps]
             x_label = "Model-forward iteration step"
         else:
             assert samples is not None
@@ -2140,6 +2148,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Maximum number of layer subplots per row.",
+    )
+    expert_parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Plot only the first N recorded model-forward iteration steps.",
     )
     expert_parser.add_argument("--output", type=Path)
     expert_parser.set_defaults(func=plot_experts)
