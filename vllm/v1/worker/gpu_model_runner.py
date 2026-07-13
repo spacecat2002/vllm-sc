@@ -7410,7 +7410,7 @@ class GPUModelRunner(
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
                 layer_id = module.layer_id
-
+                # 保存的是逻辑专家编号，表示语义上的专家选择，而不是负载均衡后的物理专家
                 def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
                     _capturer.capture(_layer_id, topk_ids)
 

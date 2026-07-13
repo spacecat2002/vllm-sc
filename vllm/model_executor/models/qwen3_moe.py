@@ -176,7 +176,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
-        self.gate = ReplicatedLinear(
+        #ReplicatedLinear保证即使在TP的情况下也可以在不同的TP上使用相同的门控参数
+        self.gate = ReplicatedLinear(  
             config.hidden_size,
             config.num_experts,
             bias=False,

@@ -136,30 +136,30 @@ class RoutedExpertsCapturer:
         """
 
         ctx = get_forward_context()
-        if ctx.dp_metadata is None:  # single dp
+        if ctx.dp_metadata is None:  # single dp, 所有token均属于当前的rank
             start_loc = 0
             end_loc = topk_ids.shape[0]
             token_num_per_dp = topk_ids.shape[0]
         else:  # multi dp
-            num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
+            num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu # 一个包含所有dp rank的token数量的tensor
             token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
             total = int(num_tokens_dp.sum().item())
             n = topk_ids.shape[0]
 
-            if n == total:
+            if n == total:  # topkid中包含所有dp rank的所有token，因此需要从中切片出当前rank的token
                 # Naive dispatch: all DP ranks' tokens concatenated
                 # before routing. This rank owns tokens
                 # [end_loc - token_num_per_dp, end_loc).
                 cumsum = torch.cumsum(num_tokens_dp, dim=0)
                 end_loc = int(cumsum[self.dp_rank].item())
                 start_loc = end_loc - token_num_per_dp
-            elif n == token_num_per_dp:
+            elif n == token_num_per_dp: # topkid只有当前rank的token
                 # Modular-kernel path: DP combine happens inside
                 # quant_method.apply; select_experts only sees this
                 # rank's tokens, take the whole tensor.
                 start_loc = 0
                 end_loc = token_num_per_dp
-            elif (
+            elif (    # SP + modular-kernel path: all-gather across the TP group
                 self.tp_size > 1
                 and n != token_num_per_dp
                 and n == (token_num_per_dp + self.tp_size - 1) // self.tp_size

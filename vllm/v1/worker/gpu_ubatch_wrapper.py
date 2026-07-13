@@ -397,7 +397,7 @@ class UBatchWrapper:
 
         return ubatch_metadata
 
-    def _slice_model_inputs(
+    def (
         self,
         tokens_slice: slice,
         input_ids,

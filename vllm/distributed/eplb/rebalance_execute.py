@@ -65,7 +65,7 @@ class AsyncEplbLayerResult:
 def get_ep_ranks_with_experts_batch(
     expert_ids: np.ndarray,
     num_local_experts: int,
-    old_indices: np.ndarray,
+    old_indices: np.ndarray, # eg. [0,1,2,3,0,1,2,3]
     new_indices: np.ndarray,
 ) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
     """
@@ -89,39 +89,41 @@ def get_ep_ranks_with_experts_batch(
     if expert_ids.size == 0:
         return ranks_to_send_map, ranks_to_recv_map
 
-    unique_experts = np.unique(expert_ids)
-    num_positions = len(old_indices)
-    position_indices = np.arange(num_positions, dtype=np.int32)
+    unique_experts = np.unique(expert_ids) # [2,0,2] -> [0,2]
+    num_positions = len(old_indices) # len([0,1,2,3,0,1,2,3]) = 8
+    position_indices = np.arange(num_positions, dtype=np.int32) # [0,1,2,3,4,5,6,7]
 
     # Vectorized approach: find all positions matching any query expert in one pass
     # Use np.isin to get boolean masks for all relevant positions at once
-    old_relevant_mask = np.isin(old_indices, unique_experts)
+    # 如果某个专家在旧布局中出现在某个 rank 的物理槽位上，就说明这个 rank 可以发送该专家的权重。
+    old_relevant_mask = np.isin(old_indices, unique_experts) # [0,1,2,3,0,1,2,3] vs [0,2] -> [True, False, True, False, True, False, True, False]
     new_relevant_mask = np.isin(new_indices, unique_experts)
 
     # Process old_indices (send ranks)
     if np.any(old_relevant_mask):
-        old_relevant_positions = position_indices[old_relevant_mask]
-        old_relevant_experts = old_indices[old_relevant_mask]
-        old_relevant_ranks = old_relevant_positions // num_local_experts
+        old_relevant_positions = position_indices[old_relevant_mask] # [0,2,4,6]
+        old_relevant_experts = old_indices[old_relevant_mask] # [0,2,0,2]
+        old_relevant_ranks = old_relevant_positions // num_local_experts # [0,2,4,6] // 4 = [0,0,1,1]
 
-        # Sort by expert first, then by position (to maintain first-appearance order)
+        # Sort by expert first, then by position (to maintain first-appearance order) 
+        # [0,2,0,2] -> [0,0,2,2], [0,0,1,1] -> [0,1,0,1]
         sort_order = np.lexsort((old_relevant_positions, old_relevant_experts))
-        sorted_experts = old_relevant_experts[sort_order]
-        sorted_ranks = old_relevant_ranks[sort_order]
+        sorted_experts = old_relevant_experts[sort_order] # [0,0,2,2]
+        sorted_ranks = old_relevant_ranks[sort_order] # [0,1,0,1]
 
         # Find boundaries where expert changes
         expert_boundaries = np.concatenate(
             [[0], np.where(np.diff(sorted_experts) != 0)[0] + 1, [len(sorted_experts)]]
-        )
+        ) # 将专家边界的索引存储在一个数组中，例如[0,2,4]表示专家0的边界是[0,2), 专家2的边界是[2,4)
 
         # For each expert, extract unique ranks in order of first appearance
-        for i in range(len(expert_boundaries) - 1):
+        for i in range(len(expert_boundaries) - 1):  # 例如当前i=0，边界为[0,2,4]
             start, end = expert_boundaries[i], expert_boundaries[i + 1]
-            expert = int(sorted_experts[start])
-            expert_ranks = sorted_ranks[start:end]
+            expert = int(sorted_experts[start]) # expert = 0
+            expert_ranks = sorted_ranks[start:end] # expert_ranks = [0,1]  # 对应的rank是[0,1]
 
             # Get unique ranks preserving order
-            _, unique_idx = np.unique(expert_ranks, return_index=True)
+            _, unique_idx = np.unique(expert_ranks, return_index=True) # 保留顺序的唯一rank索引，例如[0,1] -> [0,1]
             unique_ranks = expert_ranks[np.sort(unique_idx)]
             ranks_to_send_map[expert] = unique_ranks.tolist()
 
@@ -200,14 +202,23 @@ def move_to_buffer(
         TransferMetadata: Metadata needed for completing remote weight transfers.
     """
     assert old_indices.shape == new_indices.shape
+    # 表示当前 rank 的每个本地槽位是否是某个远程专家的“主接收槽位”。
+    # 如果一个远程专家需要在当前 rank 上保存多个副本，只接收一次，其他副本稍后从主接收槽位本地复制。
     recv_primary_mask = np.zeros((num_local_experts,), dtype=np.bool_)
+    # 保存当前 rank 需要发送的逻辑专家 ID。
     send_expert_ids = np.full((num_local_experts,), -1, dtype=np.int64)
+    # 保存每个待发送专家在当前 rank 本地权重张量中的源行。
     send_src_rows = np.full((num_local_experts,), -1, dtype=np.int32)
+    # 保存当前 rank 需要接收的逻辑专家 ID。
     recv_expert_ids = np.full((num_local_experts,), -1, dtype=np.int64)
+    # 保存每个待接收专家在当前 rank 本地权重张量中的目标行。
     recv_dst_rows = np.full((num_local_experts,), -1, dtype=np.int32)
 
+    # base是当前 rank 的第一个本地专家在全局专家索引中的位置。例如ep_rank=2, num_local_experts=4, 那么base=8
     base = ep_rank * num_local_experts
+    # 得到当前 rank 的本地权重行, 例如num_local_experts=4, 那么local_rows=[0,1,2,3]
     local_rows = np.arange(num_local_experts, dtype=np.int32)
+    # 把本地行号映射到全局行号, 例如base=8, local_rows=[0,1,2,3], 那么local_global=[8,9,10,11]
     local_global = base + local_rows
 
     old_local_expert_ids = old_indices[local_global]
@@ -218,9 +229,11 @@ def move_to_buffer(
 
     # Local receive eligibility
     new_valid = new_local_expert_ids != -1
+    # 检查新的需要接收的专家是否在旧的本地专家列表中出现过，如果出现过，说明可以直接本地复制
     can_recv_local = np.isin(
         new_local_expert_ids, old_local_expert_ids, assume_unique=False
     )
+    # 所有未改变的和可以本地复制的专家都被标记为本地接收
     is_received_locally = np.logical_or(
         is_unchanged, np.logical_and(new_valid, can_recv_local)
     )
@@ -228,15 +241,15 @@ def move_to_buffer(
     # Send map: first src row per unique expert present locally in old mapping
     send_count = 0
     valid_old = old_local_expert_ids != -1
-    if np.any(valid_old):
+    if np.any(valid_old): # 只有当前rank至少保存一个有效专家时才可以作为发送者
         uniq_experts, first_idx = np.unique(
             old_local_expert_ids[valid_old], return_index=True
-        )
-        filtered_rows = local_rows[valid_old]
-        src_rows = filtered_rows[first_idx]
-        send_count = int(uniq_experts.shape[0])
-        send_expert_ids[:send_count] = uniq_experts
-        send_src_rows[:send_count] = src_rows
+        ) # 找到当前 rank 的本地专家中每个唯一逻辑专家的第一个出现位置
+        filtered_rows = local_rows[valid_old] # 过滤掉无效的本地行，只保留有效的本地行
+        src_rows = filtered_rows[first_idx] # 对于每个唯一逻辑专家，找到其在当前 rank 本地权重张量中的源行
+        send_count = int(uniq_experts.shape[0]) # 计算当前 rank 需要发送的唯一逻辑专家数量
+        send_expert_ids[:send_count] = uniq_experts # 保存当前 rank 需要发送的逻辑专家 ID
+        send_src_rows[:send_count] = src_rows # 保存每个待发送专家在当前 rank 本地权重张量中的源行
 
     # Recv map: primary dst per unique expert needed remotely
     recv_count = 0
@@ -244,13 +257,16 @@ def move_to_buffer(
     if np.any(need_recv_mask):
         desired_experts = new_local_expert_ids[need_recv_mask]
         desired_dsts = local_rows[need_recv_mask]
-        uniq_recv_experts, uniq_indices = np.unique(desired_experts, return_index=True)
+        uniq_recv_experts, uniq_indices = np.unique(
+            desired_experts, return_index=True
+        ) # 如果同一个远程专家在多个目标槽位出现，只选择第一个主目标槽位
         dst_rows = desired_dsts[uniq_indices]
         recv_count = int(uniq_recv_experts.shape[0])
         recv_expert_ids[:recv_count] = uniq_recv_experts
         recv_dst_rows[:recv_count] = dst_rows
         recv_primary_mask[dst_rows] = True
 
+    # 目标槽位发生变化，并且当前 rank 需要接收的专家是本地接收的，才可以直接从本地复制到中间缓冲区
     eligible_local_buffer_mask = np.logical_and(~is_unchanged, is_received_locally)
 
     # 1. Local moves into tmp buffers
@@ -277,6 +293,7 @@ def move_to_buffer(
         experts = experts[order]
         srcs = srcs[order]
 
+        # send_map表示旧布局中拥有该专家的rank，recv_map表示新布局中需要该专家的rank
         send_map, recv_map = get_ep_ranks_with_experts_batch(
             experts,
             num_local_experts,
@@ -289,14 +306,15 @@ def move_to_buffer(
             ranks_to_recv = recv_map[expert]
             if not ranks_to_send or not ranks_to_recv:
                 continue
+            # 计算每个发送者至少需要负责多少个接收者
             num_dst_per_sender = len(ranks_to_recv) // len(ranks_to_send)
             sender_pos = ranks_to_send.index(ep_rank)
             recv_begin = sender_pos * num_dst_per_sender
             recv_end = recv_begin + num_dst_per_sender
             recv_ranks = ranks_to_recv[recv_begin:recv_end]
-            remainder_start = len(ranks_to_send) * num_dst_per_sender
+            remainder_start = len(ranks_to_send) * num_dst_per_sender # 计算剩余的接收者起始位置
             recver_pos = remainder_start + sender_pos
-            if recver_pos < len(ranks_to_recv):
+            if recver_pos < len(ranks_to_recv): # 如果当前发送者还有剩余的接收者需要负责
                 recv_ranks.append(ranks_to_recv[recver_pos])
             expert_tensors = [w[src] for w in expert_weights]
             for dst in recv_ranks:
@@ -323,7 +341,7 @@ def move_to_buffer(
             if not ranks_to_send or not ranks_to_recv:
                 continue
             num_dst_per_sender = len(ranks_to_recv) // len(ranks_to_send)
-            recver_pos = ranks_to_recv.index(ep_rank)
+            recver_pos = ranks_to_recv.index(ep_rank) # 按照上面send的逻辑寻找当前rank对应的发送者
             remainder_start = len(ranks_to_send) * num_dst_per_sender
             if recver_pos < remainder_start:
                 src = ranks_to_send[recver_pos // num_dst_per_sender]
@@ -561,6 +579,7 @@ def rearrange_expert_weights_inplace(
     assert len(expert_weights) == num_moe_layers
     assert len(expert_weights[0]) >= 1
 
+    # 第0维: MoE层数, 第1维: 不同的权重，比如gate_up_proj, gate_up_proj的shape[0]是物理专家的个数
     num_local_physical_experts = expert_weights[0][0].shape[0]
     assert new_global_expert_indices.shape == (num_moe_layers, num_physical_experts)
 

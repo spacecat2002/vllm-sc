@@ -297,6 +297,10 @@ class EplbState:
                 where each integer is the index of the logical expert
                 that the corresponding physical expert maps to.
         """
+        # eg. if num_routed_experts=4, num_redundant_experts=2, then the mapping is:
+        # [0, 1, 2, 3, 0, 1]
+        # means: phy 0 -> log 0, phy 1 -> log 1, phy 2 -> log 2, phy 3 -> log 3, phy 4 -> log 0, phy 5 -> log 1
+        # 物理专家就是总的专家，包括原始的主专家和复制专家，在这里表示phy4初始是复制log0的权重，但是eplb会根据负载情况重新分配
         global_physical_to_logical_map = list(range(num_routed_experts))
         global_physical_to_logical_map += [
             i % num_routed_experts for i in range(num_redundant_experts)
@@ -380,10 +384,19 @@ class EplbState:
             dtype=torch.long,
         )
 
+        # eg. physical_to_logical_map = [0, 1, 2, 3, 0, 1]
+        # 数组下标代表物理专家的编号，数组值代表逻辑专家的编号
+        # 重排之后可能不是这种顺序的，比如可能是[0, 2, 0, 1, 0, 3],
+        # 物理专家的编号就是按rank来顺序排布的
         for i in range(model.num_physical_experts):
             logical_idx = physical_to_logical_map[i]
             logical_to_physical_map[logical_idx, logical_replica_count[logical_idx]] = i
             logical_replica_count[logical_idx] += 1
+        # log 0 -> phy [0, 4, -1, -1, ..., -1]
+        # log 1 -> phy [1, 5, -1, -1, ..., -1]
+        # log 2 -> phy [2, -1, -1, -1, ..., -1]
+        # log 3 -> phy [3, -1, -1, -1, ..., -1]
+        # logical_replica_count = [2, 2, 1, 1]
 
         # Duplicate initial mapping for all layers
         physical_to_logical_map = (
@@ -412,12 +425,15 @@ class EplbState:
             .contiguous()
         )
 
+        # 当前统计周期内，这一层的某个物理专家处理了多少 token
         expert_load_pass = torch.zeros(
             (model.num_moe_layers, model.num_physical_experts),
             dtype=torch.int32,
             device=self.device,
         )
         self.expert_load_window_size = self.parallel_config.eplb_config.window_size
+
+        # 保存最近多个step内，每一层的每个物理专家处理了多少 token
         expert_load_window = torch.zeros(
             (
                 self.expert_load_window_size,
@@ -434,18 +450,20 @@ class EplbState:
             0, eplb_step_interval - eplb_step_interval // 4
         )
         self.expert_rearrangement_step_interval = eplb_step_interval
+        # eg. step_interval=100, then expert_rearrangement_step=75, expert_rearrangement_step_interval=100
+        # 经过25个step就可以进行一次负载均衡
 
         policy_type = self.parallel_config.eplb_config.policy
         self.policy = EPLB_POLICIES[policy_type]
         logger.debug("Selected EPLB policy: %s", policy_type)
 
-        model.set_eplb_state(
+        model.set_eplb_state( # 绑定到模型的每一层
             expert_load_pass,
             logical_to_physical_map,
             logical_replica_count,
         )
-        self._init_should_record_tensor(model)
-        expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
+        self._init_should_record_tensor(model) # 绑定到模型的每一层，修改一个变量就能让所有层都知道
+        expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]] # 搬运权重用的buffer
 
         communicator = create_eplb_communicator(
             group_coordinator=get_eplb_group(),
@@ -511,7 +529,7 @@ class EplbState:
             and self.expert_rearrangement_step
             % self.parallel_config.eplb_config.log_balancedness_interval
             == 0
-        ):
+        ):  # 满足日志周期，输出日志
             # Sync the expert load pass for each model (main and drafter).
             # expert_load_pass: (num_moe_layers, num_physical_experts)
             expert_load_pass_list = self._sync_load_pass()
@@ -582,6 +600,7 @@ class EplbState:
             for eplb_model_state in self.model_states.values():
                 # rebalanced must remain consistent amongst all ranks otherwise the
                 # all_reduce in _all_ranks_result_ready will hang
+                # _all_ranks_result_ready() 会用 all-reduce 检查：所有 EP rank 是否都有 pending_result
                 if eplb_model_state.rebalanced and self._all_ranks_result_ready(
                     eplb_model_state
                 ):
@@ -589,6 +608,8 @@ class EplbState:
                         model_state=eplb_model_state,
                         ep_rank=ep_group.rank(),
                     )
+                    # 将buffer中的权重写回真实的专家权重
+                    # 提交这一层新的专家映射
 
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             if self.is_async and any(
@@ -705,12 +726,13 @@ class EplbState:
                 dim=-1,
                 index=eplb_model_state.physical_to_logical_map[
                     :, : self.num_valid_physical_experts
-                ]
-                .unsqueeze(0)
-                .expand_as(expert_load_window)
-                .long(),
+                ] # 取出有效的experts
+                .unsqueeze(0) # 添加一个时间维度
+                .expand_as(expert_load_window) # 扩展到和expert_load_window一样的形状
+                .long(), # 转换为整数类型
                 src=expert_load_window,
-            )
+            ) # 将物理专家负载映射回逻辑专家，例如phy_to_log_map = [0,1,0,2], pyh_load = [10,4,7,3]
+              # 那么logical_load = [10+7, 4, 3] = [17, 4, 3]
 
             global_expert_load_window = logical_expert_load_window.sum(dim=0)
             global_expert_load_windows.append(global_expert_load_window)

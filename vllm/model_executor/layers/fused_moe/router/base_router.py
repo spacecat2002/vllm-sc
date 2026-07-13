@@ -13,7 +13,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 if current_platform.is_cuda_alike():
-
+    # 把 router 产生的逻辑专家 ID，按照当前 EPLB 的副本映射，转换成实际执行的物理专家 ID，并同时统计物理专家负载。
     @triton.jit
     def _eplb_map_and_record_i32_kernel(
         topk_ids_ptr,
@@ -311,7 +311,7 @@ class BaseRouter(FusedMoERouter):
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
 
-        if self.trace_fn is not None:
+        if self.trace_fn is not None:   # 自己加的完整调试
             self.trace_fn(hidden_states, router_logits, topk_weights, topk_ids)
 
         # Step 4: Apply EPLB mapping

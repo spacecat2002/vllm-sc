@@ -18,7 +18,8 @@ from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
 
 logger = init_logger(__name__)
 
-
+# global expert ID -> 当前 rank 的 local expert ID
+# 给定一个全局专家 ID，它在当前 rank 的本地专家权重数组中对应哪个位置
 def determine_expert_map(
     ep_size: int,
     ep_rank: int,
@@ -64,23 +65,36 @@ def determine_expert_map(
         return (global_num_experts, None, None)
 
     # Distribute experts as evenly as possible to each rank.
+    # eg. global_num_experts=10, ep_size=3 -> [4, 3, 3]
+    # 余数优先分配给前面的rank
     base_experts = global_num_experts // ep_size
     remainder = global_num_experts % ep_size
     local_num_experts = base_experts + 1 if ep_rank < remainder else base_experts
 
     # Create a tensor of size num_experts filled with -1
+    # 最开始所有的expert_map都初始化为-1，表示当前rank没有这些专家
     expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
 
     # Create an expert map for the local experts
     if expert_placement_strategy == "linear":
+        # Calculate the starting index for the local experts on this rank
         start_idx = ep_rank * base_experts + min(ep_rank, remainder)
+        # eg. global_num_experts=10, ep_size=3 -> [4, 3, 3]
+        # rank 0: start_idx=0, local_num_experts=4 -> expert_map[0:4] = [0, 1, 2, 3], 其余为-1
+        # rank 1: start_idx=4, local_num_experts=3 -> expert_map[4:7] = [0, 1, 2], 其余为-1
+        # rank 2: start_idx=7, local_num_experts=3 -> expert_map[7:10] = [0, 1, 2], 其余为-1
         expert_map[start_idx : start_idx + local_num_experts] = torch.arange(
             0, local_num_experts, dtype=torch.int32
         )
     elif expert_placement_strategy == "round_robin":
+        # In round-robin placement, experts are assigned to ranks in a cyclic manner.
+        # eg. global_num_experts=10, ep_size=3 -> rank 0: [0, 3, 6, 9], rank 1: [1, 4, 7], rank 2: [2, 5, 8]
         local_log_experts = torch.arange(
             ep_rank, global_num_experts, ep_size, dtype=torch.int32
         )
+        # rank 0: local_log_experts = [0, 3, 6, 9], local_num_experts=4
+        # rank 1: local_log_experts = [1, 4, 7], local_num_experts=3
+        # rank 2: local_log_experts = [2, 5, 8], local_num_experts=3
 
         expert_map[local_log_experts] = torch.arange(
             0, local_num_experts, dtype=torch.int32

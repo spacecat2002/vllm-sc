@@ -9,6 +9,7 @@ directly, so token distribution across EP ranks is fully controlled.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import socket
@@ -103,6 +104,7 @@ def parse_args() -> argparse.Namespace:
             "balanced",
             "concentrated",
             "local",
+            "locality_skew",
             "remote",
             "random",
             "skewed",
@@ -114,6 +116,38 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Target rank that receives the hot share for --pattern skewed.",
+    )
+    parser.add_argument(
+        "--local-share",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of each source rank's top-k assignments kept on that "
+            "same rank for --pattern locality_skew."
+        ),
+    )
+    parser.add_argument(
+        "--local-shares",
+        help=(
+            "Comma-separated local-share values to sweep, e.g. "
+            "'0,0.25,0.5,0.75,1'."
+        ),
+    )
+    parser.add_argument(
+        "--rank-skew",
+        type=float,
+        default=0.0,
+        help=(
+            "For --pattern locality_skew, interpolate remote assignments "
+            "from uniform (0) to maximally concentrated on --hot-rank (1)."
+        ),
+    )
+    parser.add_argument(
+        "--rank-skews",
+        help=(
+            "Comma-separated rank-skew values to sweep, e.g. "
+            "'0,0.25,0.5,0.75,1'."
+        ),
     )
     parser.add_argument(
         "--hot-share",
@@ -140,20 +174,25 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help=(
             "Fraction of iterations to drop from each tail when computing "
-            "summary means. Rows are trimmed by max_total_ms."
+            "summary means. Rows are trimmed by max_end_to_end_ms."
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--stage-barrier",
         action="store_true",
+        default=True,
         help=(
-            "Synchronize all ranks before each measured stage. This removes "
-            "arrival skew from dispatch/compute/combine timings, at the cost "
-            "of making the benchmark less like the original pipeline."
+            "Synchronize all ranks before each measured stage. This benchmark "
+            "keeps stage barriers enabled so stage timings are comparable."
         ),
     )
     parser.add_argument("--output-jsonl", type=Path)
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        help="Write one trimmed summary row per sweep point as CSV.",
+    )
     parser.add_argument(
         "--nproc-per-node",
         type=int,
@@ -198,16 +237,20 @@ def bytes_to_mib(num_bytes: int | float) -> float:
     return float(num_bytes) / (1024 * 1024)
 
 
-def parse_hot_share_values(args: argparse.Namespace) -> list[float]:
-    if args.hot_shares is None:
-        return [args.hot_share]
+def parse_float_values(
+    raw_values: str | None,
+    default: float,
+    name: str,
+) -> list[float]:
+    if raw_values is None:
+        return [default]
     values = []
-    for raw_value in args.hot_shares.split(","):
+    for raw_value in raw_values.split(","):
         value = raw_value.strip()
         if value:
             values.append(float(value))
     if not values:
-        raise ValueError("--hot-shares must contain at least one value.")
+        raise ValueError(f"{name} must contain at least one value.")
     return values
 
 
@@ -218,7 +261,10 @@ def trim_aggregates(
     trim_count = int(len(aggregates) * trim_ratio)
     if trim_count == 0 or trim_count * 2 >= len(aggregates):
         return aggregates
-    sorted_by_total = sorted(aggregates, key=lambda record: record["max_total_ms"])
+    sorted_by_total = sorted(
+        aggregates,
+        key=lambda record: record["max_end_to_end_ms"],
+    )
     kept = sorted_by_total[trim_count:-trim_count]
     return sorted(kept, key=lambda record: record["iter"])
 
@@ -261,6 +307,121 @@ def cycle_pool(pool: list[int], rows: int, cols: int, offset: int) -> torch.Tens
     return torch.tensor(values, dtype=torch.int64).view(rows, cols)
 
 
+def apportion(total: int, weights: list[float], offset: int = 0) -> list[int]:
+    """Convert fractional weights to deterministic integer counts."""
+    raw_counts = [total * weight for weight in weights]
+    counts = [int(count) for count in raw_counts]
+    remainder = total - sum(counts)
+    order = sorted(
+        range(len(weights)),
+        key=lambda index: (
+            raw_counts[index] - counts[index],
+            -((index - offset) % len(weights)),
+        ),
+        reverse=True,
+    )
+    for index in order[:remainder]:
+        counts[index] += 1
+    return counts
+
+
+def make_ids_from_rank_counts(
+    tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    source_rank: int,
+    counts: list[int],
+) -> torch.Tensor:
+    world_size = len(counts)
+    total = tokens * top_k
+    if sum(counts) != total:
+        raise ValueError(f"Rank counts must sum to {total}, got {sum(counts)}.")
+
+    targets = []
+    remaining = counts[:]
+    start_rank = source_rank % world_size
+    while sum(remaining) > 0:
+        made_progress = False
+        for offset in range(world_size):
+            target_rank = (start_rank + offset) % world_size
+            if remaining[target_rank] > 0:
+                targets.append(target_rank)
+                remaining[target_rank] -= 1
+                made_progress = True
+        if not made_progress:
+            break
+
+    seen_per_rank = [0] * world_size
+    expert_ids = []
+    for token_start in range(0, total, top_k):
+        used_experts: set[int] = set()
+        token_targets = targets[token_start : token_start + top_k]
+        for target_rank in token_targets:
+            for _ in range(num_local_experts):
+                local_expert = seen_per_rank[target_rank] % num_local_experts
+                expert_id = target_rank * num_local_experts + local_expert
+                seen_per_rank[target_rank] += 1
+                if expert_id not in used_experts:
+                    expert_ids.append(expert_id)
+                    used_experts.add(expert_id)
+                    break
+            else:
+                raise ValueError(
+                    "The requested distribution cannot provide unique top-k "
+                    "experts for every token. Increase --num-experts, reduce "
+                    "--top-k, or use a less extreme share."
+                )
+    return torch.tensor(expert_ids, dtype=torch.int64).view(tokens, top_k)
+
+
+def make_locality_skewed_ids(
+    tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    world_size: int,
+    source_rank: int,
+    hot_rank: int,
+    local_share: float,
+    rank_skew: float,
+) -> torch.Tensor:
+    """Keep locality fixed while independently varying destination skew."""
+    total = tokens * top_k
+    if world_size == 1:
+        return make_ids_from_rank_counts(
+            tokens,
+            top_k,
+            num_local_experts,
+            source_rank,
+            [total],
+        )
+
+    local_count = round(total * local_share)
+    remote_count = total - local_count
+    normalized_hot_rank = hot_rank % world_size
+    remote_ranks = [rank for rank in range(world_size) if rank != source_rank]
+    uniform_weight = 1.0 / len(remote_ranks)
+    if source_rank == normalized_hot_rank:
+        remote_weights = [uniform_weight] * len(remote_ranks)
+    else:
+        remote_weights = [
+            (1.0 - rank_skew) * uniform_weight
+            + rank_skew * float(rank == normalized_hot_rank)
+            for rank in remote_ranks
+        ]
+    remote_counts = apportion(remote_count, remote_weights, offset=source_rank)
+    counts = [0] * world_size
+    counts[source_rank] = local_count
+    for target_rank, count in zip(remote_ranks, remote_counts):
+        counts[target_rank] = count
+    return make_ids_from_rank_counts(
+        tokens,
+        top_k,
+        num_local_experts,
+        source_rank,
+        counts,
+    )
+
+
 def make_rank_skewed_ids(
     tokens: int,
     top_k: int,
@@ -289,37 +450,13 @@ def make_rank_skewed_ids(
         for index in range(total - hot_count):
             counts[other_ranks[index % len(other_ranks)]] += 1
 
-    targets = []
-    remaining = counts[:]
-    start_rank = source_rank % world_size
-    while sum(remaining) > 0:
-        for offset in range(world_size):
-            target_rank = (start_rank + offset) % world_size
-            if remaining[target_rank] > 0:
-                targets.append(target_rank)
-                remaining[target_rank] -= 1
-
-    seen_per_rank = [0] * world_size
-    expert_ids = []
-    for token_start in range(0, total, top_k):
-        used_experts: set[int] = set()
-        token_targets = targets[token_start : token_start + top_k]
-        for target_rank in token_targets:
-            for _ in range(num_local_experts):
-                local_expert = seen_per_rank[target_rank] % num_local_experts
-                expert_id = target_rank * num_local_experts + local_expert
-                seen_per_rank[target_rank] += 1
-                if expert_id not in used_experts:
-                    expert_ids.append(expert_id)
-                    used_experts.add(expert_id)
-                    break
-            else:
-                raise ValueError(
-                    "Cannot generate unique top-k experts for one token. "
-                    f"top_k={top_k}, target_rank={target_rank}, "
-                    f"num_local_experts={num_local_experts}."
-                )
-    return torch.tensor(expert_ids, dtype=torch.int64).view(tokens, top_k)
+    return make_ids_from_rank_counts(
+        tokens,
+        top_k,
+        num_local_experts,
+        source_rank,
+        counts,
+    )
 
 
 def make_topk_ids(
@@ -333,6 +470,8 @@ def make_topk_ids(
     seed: int,
     hot_rank: int,
     hot_share: float,
+    local_share: float,
+    rank_skew: float,
 ) -> torch.Tensor:
     num_local_experts = num_experts // world_size
     if pattern == "balanced":
@@ -344,6 +483,17 @@ def make_topk_ids(
     elif pattern == "local":
         pool = contiguous_experts_for_rank(rank, num_local_experts)
         ids = cycle_pool(pool, tokens, top_k, offset=0)
+    elif pattern == "locality_skew":
+        ids = make_locality_skewed_ids(
+            tokens,
+            top_k,
+            num_local_experts,
+            world_size,
+            rank,
+            hot_rank,
+            local_share,
+            rank_skew,
+        )
     elif pattern == "remote":
         target_rank = (rank + 1) % world_size
         pool = contiguous_experts_for_rank(target_rank, num_local_experts)
@@ -517,6 +667,8 @@ def make_inputs(
         args.seed,
         args.hot_rank,
         args.hot_share,
+        args.local_share,
+        args.rank_skew,
     )
     topk_weights = torch.full(
         (args.tokens, args.top_k),
@@ -582,13 +734,15 @@ def run_one_iter(
             False,
         )
 
+    sync_stage_start(device, args.stage_barrier)
+    iteration_start = time.perf_counter()
     (
         a1q,
         a1q_scale,
         expert_tokens_meta,
         dispatched_topk_ids,
         dispatched_topk_weights,
-    ), dispatch_ms = time_stage(device, prepare, use_barrier=args.stage_barrier)
+    ), dispatch_ms = time_stage(device, prepare)
 
     def compute():
         return kernel.impl._fused_experts(
@@ -627,6 +781,7 @@ def run_one_iter(
         )
 
     _, combine_ms = time_stage(device, finalize, use_barrier=args.stage_barrier)
+    end_to_end_ms = (time.perf_counter() - iteration_start) * 1000.0
 
     if expert_tokens_meta is not None:
         local_expert_tokens = [
@@ -644,6 +799,8 @@ def run_one_iter(
         "pattern": args.pattern,
         "backend": args.backend,
         "hot_share": args.hot_share,
+        "local_share": args.local_share,
+        "rank_skew": args.rank_skew,
         "stage_barrier": args.stage_barrier,
         "iter": iteration,
         "rank": rank,
@@ -658,6 +815,7 @@ def run_one_iter(
         "expert_compute_ms": compute_ms,
         "combine_ms": combine_ms,
         "total_ms": dispatch_ms + compute_ms + combine_ms,
+        "end_to_end_ms": end_to_end_ms,
         "source_target_assignments": target_assignments,
         "source_target_unique_tokens": target_unique_tokens,
         "source_distribution": distribution_metrics(target_assignments),
@@ -683,6 +841,7 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         compute = [r["expert_compute_ms"] for r in iter_records]
         combine = [r["combine_ms"] for r in iter_records]
         total = [r["total_ms"] for r in iter_records]
+        end_to_end = [r["end_to_end_ms"] for r in iter_records]
         received = [r["received_tokens"] for r in iter_records]
         remote_shares = [r["remote_assignment_share"] for r in iter_records]
         dispatch_remote_bytes = [r["dispatch_remote_bytes"] for r in iter_records]
@@ -705,6 +864,8 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "record_type": "aggregate",
                 "iter": iteration,
                 "hot_share": iter_records[0]["hot_share"],
+                "local_share": iter_records[0]["local_share"],
+                "rank_skew": iter_records[0]["rank_skew"],
                 "max_dispatch_ms": max(dispatch),
                 "mean_dispatch_ms": statistics.mean(dispatch),
                 "max_expert_compute_ms": max(compute),
@@ -713,6 +874,8 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "mean_combine_ms": statistics.mean(combine),
                 "max_total_ms": max(total),
                 "mean_total_ms": statistics.mean(total),
+                "max_end_to_end_ms": max(end_to_end),
+                "mean_end_to_end_ms": statistics.mean(end_to_end),
                 "compute_imbalance": max(compute) / mean_compute
                 if mean_compute
                 else 0.0,
@@ -748,17 +911,31 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def make_sweep_summary_row(
     args: argparse.Namespace,
     aggregates: list[dict[str, Any]],
 ) -> dict[str, Any]:
     summary_aggregates = trim_aggregates(aggregates, args.trim_ratio)
     return {
+        "record_type": "summary",
         "hot_share": aggregates[0]["hot_share"],
+        "local_share": aggregates[0]["local_share"],
+        "rank_skew": aggregates[0]["rank_skew"],
         "iters": len(aggregates),
         "trimmed_iters": len(summary_aggregates),
         "mean_max_total_ms": statistics.mean(
             r["max_total_ms"] for r in summary_aggregates
+        ),
+        "mean_max_end_to_end_ms": statistics.mean(
+            r["max_end_to_end_ms"] for r in summary_aggregates
         ),
         "mean_max_dispatch_ms": statistics.mean(
             r["max_dispatch_ms"] for r in summary_aggregates
@@ -800,15 +977,17 @@ def print_sweep_summary(rows: list[dict[str, Any]]) -> None:
     print()
     print("sweep summary")
     print(
-        "hot_share iters trimmed mean_total mean_dispatch mean_compute "
-        "mean_combine time_imbalance token_imbalance remote_share "
+        "local_share rank_skew iters trimmed end_to_end stage_sum mean_dispatch "
+        "mean_compute mean_combine time_imbalance token_imbalance remote_share "
         "target_imbalance dispatch_mib a2a_mib max_recv_mib"
     )
     for row in rows:
         print(
-            f"{row['hot_share']:>9.3f} "
+            f"{row['local_share']:>11.3f} "
+            f"{row['rank_skew']:>9.3f} "
             f"{row['iters']:>5} "
             f"{row['trimmed_iters']:>7} "
+            f"{row['mean_max_end_to_end_ms']:>10.3f} "
             f"{row['mean_max_total_ms']:>10.3f} "
             f"{row['mean_max_dispatch_ms']:>13.3f} "
             f"{row['mean_max_compute_ms']:>12.3f} "
@@ -828,13 +1007,14 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
         return
     summary_aggregates = trim_aggregates(aggregates, args.trim_ratio)
     print(
-        "iter max_total max_dispatch max_compute max_combine "
+        "iter end_to_end stage_sum max_dispatch max_compute max_combine "
         "time_imbalance token_imbalance recv_min recv_max recv_imbalance "
         "remote_share target_imbalance dispatch_mib a2a_mib max_recv_mib"
     )
     for record in aggregates:
         print(
             f"{record['iter']:>4} "
+            f"{record['max_end_to_end_ms']:>10.3f} "
             f"{record['max_total_ms']:>9.3f} "
             f"{record['max_dispatch_ms']:>12.3f} "
             f"{record['max_expert_compute_ms']:>11.3f} "
@@ -854,15 +1034,19 @@ def print_summary(args: argparse.Namespace, aggregates: list[dict[str, Any]]) ->
     print()
     print(
         f"pattern={args.pattern} backend={args.backend} "
-        f"hot_share={aggregates[0]['hot_share']} "
+        f"local_share={aggregates[0]['local_share']} "
+        f"rank_skew={aggregates[0]['rank_skew']} "
         f"iters={len(aggregates)} trimmed_iters={len(summary_aggregates)} "
         f"trim_ratio={args.trim_ratio}"
+    )
+    mean_max_compute = statistics.mean(
+        r["max_expert_compute_ms"] for r in summary_aggregates
     )
     print(
         "mean(max_dispatch_ms)="
         f"{statistics.mean(r['max_dispatch_ms'] for r in summary_aggregates):.3f}, "
         "mean(max_compute_ms)="
-        f"{statistics.mean(r['max_expert_compute_ms'] for r in summary_aggregates):.3f}, "
+        f"{mean_max_compute:.3f}, "
         "mean(max_combine_ms)="
         f"{statistics.mean(r['max_combine_ms'] for r in summary_aggregates):.3f}, "
         "mean(compute_imbalance)="
@@ -926,7 +1110,6 @@ def _run_worker(
             device=device,
             dtype=torch.int,
         )
-        hot_share_values = args.hot_share_values
         output_records: list[dict[str, Any]] = []
         sweep_summary_rows: list[dict[str, Any]] = []
 
@@ -969,7 +1152,9 @@ def _run_worker(
 
             ctx = get_forward_context()
 
-            for hot_share in hot_share_values:
+            for local_share, rank_skew, hot_share in args.sweep_points:
+                args.local_share = local_share
+                args.rank_skew = rank_skew
                 args.hot_share = hot_share
                 tensors = make_inputs(args, rank, world_size, dtype, device)
                 if ctx.dp_metadata is None:
@@ -990,9 +1175,9 @@ def _run_worker(
                     ]
                     aggregates = aggregate_records(records)
                     output_records.extend(records + aggregates)
-                    sweep_summary_rows.append(
-                        make_sweep_summary_row(args, aggregates)
-                    )
+                    summary_row = make_sweep_summary_row(args, aggregates)
+                    sweep_summary_rows.append(summary_row)
+                    output_records.append(summary_row)
                     print_summary(args, aggregates)
 
             if rank == 0:
@@ -1001,6 +1186,9 @@ def _run_worker(
         if rank == 0 and args.output_jsonl is not None:
             write_jsonl(args.output_jsonl, output_records)
             print(f"Wrote JSONL: {args.output_jsonl}")
+        if rank == 0 and args.output_csv is not None:
+            write_csv(args.output_csv, sweep_summary_rows)
+            print(f"Wrote CSV: {args.output_csv}")
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -1038,13 +1226,45 @@ def _launched_with_torchrun() -> bool:
 
 def main() -> None:
     args = parse_args()
-    args.hot_share_values = parse_hot_share_values(args)
-
-    for hot_share in args.hot_share_values:
-        if not 0.0 <= hot_share <= 1.0:
-            raise ValueError("--hot-share values must be between 0.0 and 1.0.")
+    hot_share_values = parse_float_values(
+        args.hot_shares,
+        args.hot_share,
+        "--hot-shares",
+    )
+    local_share_values = parse_float_values(
+        args.local_shares,
+        args.local_share,
+        "--local-shares",
+    )
+    rank_skew_values = parse_float_values(
+        args.rank_skews,
+        args.rank_skew,
+        "--rank-skews",
+    )
+    for name, values in (
+        ("--hot-share", hot_share_values),
+        ("--local-share", local_share_values),
+        ("--rank-skew", rank_skew_values),
+    ):
+        if any(not 0.0 <= value <= 1.0 for value in values):
+            raise ValueError(f"{name} values must be between 0.0 and 1.0.")
+    if args.pattern == "locality_skew":
+        args.sweep_points = [
+            (local_share, rank_skew, args.hot_share)
+            for local_share in local_share_values
+            for rank_skew in rank_skew_values
+        ]
+    elif args.pattern == "skewed":
+        args.sweep_points = [
+            (args.local_share, args.rank_skew, hot_share)
+            for hot_share in hot_share_values
+        ]
+    else:
+        args.sweep_points = [(args.local_share, args.rank_skew, args.hot_share)]
     if not 0.0 <= args.trim_ratio < 0.5:
         raise ValueError("--trim-ratio must be in [0.0, 0.5).")
+    if args.iters <= 0:
+        raise ValueError("--iters must be positive.")
 
     if _launched_with_torchrun():
         try:
