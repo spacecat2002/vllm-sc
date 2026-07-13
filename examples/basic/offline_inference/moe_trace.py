@@ -850,23 +850,30 @@ def plot_experts(args: argparse.Namespace) -> None:
     import matplotlib.pyplot as plt
 
     trace_dir = args.trace_dir.resolve()
-    metadata = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
+    metadata = json.loads(
+        (trace_dir / "metadata.json").read_text(encoding="utf-8")
+    )
     num_experts = args.num_experts or int(metadata["num_experts"])
     layers = args.layers or [0]
     colors = _categorical_expert_colors(num_experts)
+    if args.columns <= 0:
+        raise ValueError("--columns must be positive")
 
     samples = None
     if args.x_axis == "sample":
         samples, metadata = _load_route_samples(trace_dir)
 
+    num_columns = min(args.columns, len(layers))
+    num_rows = (len(layers) + num_columns - 1) // num_columns
     fig, axes = plt.subplots(
-        len(layers),
-        2,
-        figsize=(13, max(4.0, 3.8 * len(layers))),
+        num_rows,
+        num_columns,
+        figsize=(5.2 * num_columns, 3.8 * num_rows),
         squeeze=False,
         sharey=True,
     )
-    for row, layer_id in enumerate(layers):
+    flat_axes = axes.ravel()
+    for plot_id, layer_id in enumerate(layers):
         if args.x_axis == "step":
             x, shares = _expert_load_share_by_step(
                 trace_dir,
@@ -886,33 +893,27 @@ def plot_experts(args: argparse.Namespace) -> None:
                 args.phase,
             )
             x_label = "Sample"
-        sorted_shares = np.sort(shares, axis=1)[:, ::-1]
-
-        axes[row, 0].stackplot(
+        axis = flat_axes[plot_id]
+        axis.stackplot(
             x,
             shares.T,
             colors=colors,
             edgecolor="#202020",
             linewidth=0.15,
         )
-        axes[row, 0].set_title(f"Layer {layer_id}: fixed expert IDs")
-        axes[row, 1].stackplot(
-            x,
-            sorted_shares.T,
-            colors=colors,
-            edgecolor="#202020",
-            linewidth=0.15,
-        )
-        axes[row, 1].set_title(f"Layer {layer_id}: experts sorted by load")
-        axes[row, 0].set_ylabel("Expert load share (%)")
-        for axis in axes[row]:
-            if len(x) == 1:
-                axis.set_xlim(float(x[0]) - 0.5, float(x[0]) + 0.5)
-            else:
-                axis.set_xlim(float(x[0]), float(x[-1]))
-            axis.set_ylim(0, 100)
-            axis.set_xlabel(x_label)
-            axis.grid(alpha=0.15)
+        axis.set_title(f"Layer {layer_id}")
+        if plot_id % num_columns == 0:
+            axis.set_ylabel("Expert load share (%)")
+        if len(x) == 1:
+            axis.set_xlim(float(x[0]) - 0.5, float(x[0]) + 0.5)
+        else:
+            axis.set_xlim(float(x[0]), float(x[-1]))
+        axis.set_ylim(0, 100)
+        axis.set_xlabel(x_label)
+        axis.grid(alpha=0.15)
+
+    for axis in flat_axes[len(layers) :]:
+        axis.set_visible(False)
 
     title = metadata.get("model", "MoE expert load distribution")
     fig.suptitle(f"{title} ({args.phase})", fontsize=14)
@@ -2133,6 +2134,12 @@ def parse_args() -> argparse.Namespace:
             "Plot actual model-forward iteration steps by default. Use "
             "'sample' for the original per-prompt view."
         ),
+    )
+    expert_parser.add_argument(
+        "--columns",
+        type=int,
+        default=4,
+        help="Maximum number of layer subplots per row.",
     )
     expert_parser.add_argument("--output", type=Path)
     expert_parser.set_defaults(func=plot_experts)
