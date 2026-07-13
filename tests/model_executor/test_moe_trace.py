@@ -129,3 +129,50 @@ def test_moe_trace_collector_selects_batched_prefill_and_decode(tmp_path):
     assert torch.equal(record["selected_token_indices"], torch.tensor([2, 3]))
     assert torch.equal(record["token_phases"], torch.tensor([0, 1], dtype=torch.int8))
     assert torch.equal(record["activations"].float(), hidden_states[[2, 3]])
+
+
+def test_moe_trace_collector_selects_all_batched_tokens(tmp_path):
+    config = MoETraceConfig(
+        output_dir=tmp_path,
+        max_steps=1,
+        max_tokens=8,
+        activations="input",
+        activation_dtype=torch.float16,
+        token_selection="all",
+    )
+    collector = MoETraceCollector(config, {0: "layer.0"})
+    collector.begin_forward(
+        num_scheduled_tokens=[3, 1],
+        num_computed_tokens=[2, 5],
+        prefill_lengths=[5, 5],
+        request_ids=["prefill-request", "decode-request"],
+    )
+    hidden_states = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    router_logits = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    topk_ids = torch.arange(8).reshape(4, 2)
+    topk_weights = torch.full((4, 2), 0.5)
+
+    collector.capture(
+        0,
+        hidden_states,
+        router_logits,
+        topk_weights,
+        topk_ids,
+    )
+
+    record = torch.load(
+        tmp_path / "rank_00000" / "step_000000_layer_0000.pt",
+        weights_only=True,
+    )
+    assert record["phase"] == "mixed"
+    assert torch.equal(record["selected_token_indices"], torch.arange(4))
+    assert torch.equal(
+        record["token_phases"], torch.tensor([0, 0, 0, 1], dtype=torch.int8)
+    )
+    assert record["request_ids"] == [
+        "prefill-request",
+        "prefill-request",
+        "prefill-request",
+        "decode-request",
+    ]
+    assert torch.equal(record["activations"].float(), hidden_states)

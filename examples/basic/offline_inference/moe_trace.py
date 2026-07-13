@@ -494,7 +494,10 @@ def collect(args: argparse.Namespace) -> None:
     os.environ["VLLM_MOE_TRACE_MAX_TOKENS"] = str(args.max_tokens_per_sample)
     os.environ["VLLM_MOE_TRACE_ACTIVATIONS"] = "input"
     os.environ["VLLM_MOE_TRACE_ACTIVATION_DTYPE"] = args.activation_dtype
-    os.environ["VLLM_MOE_TRACE_TOKEN_SELECTION"] = "prefill_last"
+    # Keep every scheduled prefill and decode token. The collector also saves
+    # per-token phase labels, so plotting can isolate prefill without sampling
+    # it down to the final prompt token.
+    os.environ["VLLM_MOE_TRACE_TOKEN_SELECTION"] = "all"
     os.environ["VLLM_MOE_TRACE_NEXT_GATE"] = "1" if args.trace_next_gate else "0"
     if args.next_gate_lora_dir is not None:
         os.environ["VLLM_MOE_TRACE_NEXT_GATE_LORA_DIR"] = str(
@@ -563,9 +566,7 @@ def collect(args: argparse.Namespace) -> None:
         "sample_dp_ranks": sample_dp_ranks,
         "route_shape": "[token, layer, top_k]",
         "activation_point": "input to each MoE router",
-        "activation_token_selection": (
-            "last prompt token for prefill; each token for decode"
-        ),
+        "activation_token_selection": "all scheduled prefill and decode tokens",
         "trace_next_gate": args.trace_next_gate,
         "next_gate_lora_dir": str(args.next_gate_lora_dir)
         if args.next_gate_lora_dir is not None
@@ -798,15 +799,65 @@ def _categorical_expert_colors(num_experts: int) -> np.ndarray:
     return hsv_to_rgb(np.column_stack((hues, saturations, values)))
 
 
+def _expert_load_share_by_step(
+    trace_dir: Path,
+    layer_id: int,
+    num_experts: int,
+    phase: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aggregate expert load across ranks for each model-forward step."""
+    import torch
+
+    activation_root = trace_dir / "activations"
+    records = _load_activation_records(activation_root, None, torch)
+    counts_by_step: dict[int, np.ndarray] = {}
+    for (_, step, record_layer_id), record in records.items():
+        if record_layer_id != layer_id:
+            continue
+
+        ids = record["topk_ids"].numpy()
+        mask = _phase_mask(record, phase)
+        if mask is not None:
+            ids = ids[mask]
+        elif phase != "all":
+            raise ValueError(
+                "The activation trace has no token phase metadata; "
+                f"cannot select phase {phase!r}"
+            )
+
+        ids = ids.reshape(-1)
+        ids = ids[(ids >= 0) & (ids < num_experts)]
+        counts = np.bincount(ids, minlength=num_experts).astype(np.float64)
+        if step not in counts_by_step:
+            counts_by_step[step] = counts
+        else:
+            counts_by_step[step] += counts
+
+    if not counts_by_step:
+        raise ValueError(
+            f"Layer {layer_id} is unavailable under {activation_root}"
+        )
+
+    steps = np.asarray(sorted(counts_by_step), dtype=np.int64)
+    shares = np.stack([counts_by_step[int(step)] for step in steps])
+    totals = shares.sum(axis=1, keepdims=True)
+    np.divide(shares, totals, out=shares, where=totals != 0)
+    shares *= 100.0
+    return steps, shares
+
+
 def plot_experts(args: argparse.Namespace) -> None:
     import matplotlib.pyplot as plt
 
     trace_dir = args.trace_dir.resolve()
-    samples, metadata = _load_route_samples(trace_dir)
+    metadata = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
     num_experts = args.num_experts or int(metadata["num_experts"])
     layers = args.layers or [0]
-    prompt_token_counts = metadata["prompt_token_counts"]
     colors = _categorical_expert_colors(num_experts)
+
+    samples = None
+    if args.x_axis == "sample":
+        samples, metadata = _load_route_samples(trace_dir)
 
     fig, axes = plt.subplots(
         len(layers),
@@ -815,15 +866,26 @@ def plot_experts(args: argparse.Namespace) -> None:
         squeeze=False,
         sharey=True,
     )
-    x = np.arange(len(samples))
     for row, layer_id in enumerate(layers):
-        shares = _expert_load_share(
-            samples,
-            layer_id,
-            num_experts,
-            prompt_token_counts,
-            args.phase,
-        )
+        if args.x_axis == "step":
+            x, shares = _expert_load_share_by_step(
+                trace_dir,
+                layer_id,
+                num_experts,
+                args.phase,
+            )
+            x_label = "Model-forward iteration step"
+        else:
+            assert samples is not None
+            x = np.arange(len(samples))
+            shares = _expert_load_share(
+                samples,
+                layer_id,
+                num_experts,
+                metadata["prompt_token_counts"],
+                args.phase,
+            )
+            x_label = "Sample"
         sorted_shares = np.sort(shares, axis=1)[:, ::-1]
 
         axes[row, 0].stackplot(
@@ -844,9 +906,12 @@ def plot_experts(args: argparse.Namespace) -> None:
         axes[row, 1].set_title(f"Layer {layer_id}: experts sorted by load")
         axes[row, 0].set_ylabel("Expert load share (%)")
         for axis in axes[row]:
-            axis.set_xlim(0, max(len(samples) - 1, 1))
+            if len(x) == 1:
+                axis.set_xlim(float(x[0]) - 0.5, float(x[0]) + 0.5)
+            else:
+                axis.set_xlim(float(x[0]), float(x[-1]))
             axis.set_ylim(0, 100)
-            axis.set_xlabel("Sample")
+            axis.set_xlabel(x_label)
             axis.grid(alpha=0.15)
 
     title = metadata.get("model", "MoE expert load distribution")
@@ -2059,6 +2124,15 @@ def parse_args() -> argparse.Namespace:
     expert_parser.add_argument("--num-experts", type=int)
     expert_parser.add_argument(
         "--phase", choices=("prefill", "decode", "all"), default="all"
+    )
+    expert_parser.add_argument(
+        "--x-axis",
+        choices=("step", "sample"),
+        default="step",
+        help=(
+            "Plot actual model-forward iteration steps by default. Use "
+            "'sample' for the original per-prompt view."
+        ),
     )
     expert_parser.add_argument("--output", type=Path)
     expert_parser.set_defaults(func=plot_experts)

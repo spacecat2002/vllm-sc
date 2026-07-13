@@ -195,15 +195,11 @@ class MoETraceCollector:
         """Describe the packed request layout for the next model forward.
 
         The model runner packs each request into one contiguous token span.
-        For every request, retain the final scheduled prefill token and all
-        scheduled decode tokens. This makes batched prefill and batched decode
+        For every request, retain either all scheduled tokens or the final
+        scheduled prefill token plus all decode tokens, according to the trace
+        configuration. This makes batched prefill and batched decode
         unambiguous; tensor row count alone cannot distinguish them.
         """
-        if self.config.token_selection != "prefill_last":
-            self._selected_token_indices = None
-            self._selected_token_phases = None
-            self._selected_request_ids = None
-            return
         if not (
             len(num_scheduled_tokens)
             == len(num_computed_tokens)
@@ -226,14 +222,22 @@ class MoETraceCollector:
             request_ids,
         ):
             prompt_tokens = min(scheduled, max(prefill_length - computed, 0))
-            if prompt_tokens > 0:
+            if self.config.token_selection == "all":
+                indices.extend(range(request_start, request_start + scheduled))
+                phases.extend([0] * prompt_tokens)
+                phases.extend([1] * (scheduled - prompt_tokens))
+                selected_request_ids.extend([request_id] * scheduled)
+            elif prompt_tokens > 0:
                 indices.append(request_start + prompt_tokens - 1)
                 phases.append(0)  # prefill
                 selected_request_ids.append(request_id)
-            decode_start = request_start + prompt_tokens
-            indices.extend(range(decode_start, request_start + scheduled))
-            phases.extend([1] * (scheduled - prompt_tokens))  # decode
-            selected_request_ids.extend([request_id] * (scheduled - prompt_tokens))
+            if self.config.token_selection == "prefill_last":
+                decode_start = request_start + prompt_tokens
+                indices.extend(range(decode_start, request_start + scheduled))
+                phases.extend([1] * (scheduled - prompt_tokens))  # decode
+                selected_request_ids.extend(
+                    [request_id] * (scheduled - prompt_tokens)
+                )
             request_start += scheduled
 
         self._selected_token_indices = indices[: self.config.max_tokens]
@@ -263,10 +267,7 @@ class MoETraceCollector:
         selected_indices = self._selected_token_indices
         selected_phases = self._selected_token_phases
         selected_request_ids = self._selected_request_ids
-        if (
-            self.config.token_selection == "prefill_last"
-            and selected_indices is not None
-        ):
+        if selected_indices is not None:
             assert selected_phases is not None
             assert selected_request_ids is not None
             valid = [
