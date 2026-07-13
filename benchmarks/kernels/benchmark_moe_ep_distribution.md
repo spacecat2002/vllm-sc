@@ -151,16 +151,21 @@ trim 后的 sweep summary，主要用于绘图。
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib-cache \
 .venv/bin/python benchmarks/kernels/plot_moe_ep_distribution.py \
-  --input-csv results/data/moe_ep_distribution.csv \
-  --output results/plots/moe_ep_distribution.png \
-  --skew-local-share 0.5
+  --input-jsonl results/data/moe_ep_distribution.jsonl \
+  --output-dir results/plots \
+  --prefix moe_ep_distribution
 ```
 
 JSONL 和 CSV 数据保存在 `results/data/`，生成的 PNG 单独保存在
-`results/plots/`。图片包含四张折线图：通信比例的 stage 耗时、固定
-`local_share` 的负载倾斜 stage 耗时、所有 `local_share` 对应的
-`rank_skew` stage-sum 曲线，以及所有 `rank_skew` 对应的 `local_share`
-stage-sum 曲线。图中不绘制 end-to-end latency。
+`results/plots/`。绘图脚本为每个 `local_share × rank_skew` 参数组合生成一张
+PNG。例如 5 个 `local_share` 和 5 个 `rank_skew` 会生成 25 张图。文件名形如：
+
+```text
+moe_ep_distribution_local_0p5_skew_0p25.png
+```
+
+每张图的横轴是 iteration，三条折线分别表示该参数组合下各次迭代的 dispatch、
+compute 和 combine 最大 rank 耗时。图中不绘制 end-to-end latency。
 
 ## 结果解读
 
@@ -172,6 +177,6 @@ stage-sum 曲线。图中不绘制 end-to-end latency。
 然后观察 `mean_token_imbalance`、`mean_max_compute_ms` 和 stage-sum latency
 之间的关系。
 
-图中的 `mean_max_total_ms` 是同一 rank 上 dispatch、compute 和 combine 耗时的
-和，用于比较不同路由分布下的 stage 总成本；它不等于真实端到端延迟。CSV 和
-JSONL 中仍保留 `mean_max_end_to_end_ms`，但绘图脚本不再展示该指标。
+每张图使用 JSONL 中的 aggregate 记录：先对每次迭代取所有 rank 的最大 stage
+耗时，再按 iteration 绘制。CSV 中仍保留 trimmed summary，适合做额外的统计
+分析；JSONL 中也保留 end-to-end 指标，但绘图脚本不展示该指标。

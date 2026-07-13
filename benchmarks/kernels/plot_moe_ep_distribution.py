@@ -1,45 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Plot locality/skew sweeps from benchmark_moe_ep_distribution.py."""
+"""Plot one iteration-latency figure per MoE EP sweep point."""
 
 from __future__ import annotations
 
 import argparse
-import csv
+import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-csv", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--input-jsonl", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--skew-local-share",
-        type=float,
-        default=0.5,
-        help="Local-share slice used by the rank-skew line plot.",
+        "--prefix",
+        default="moe_ep",
+        help="Filename prefix for generated PNG files.",
     )
     return parser.parse_args()
 
 
-def read_rows(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        raise ValueError(f"No summary rows found in {path}.")
-    numeric_fields = set(rows[0]) - {"record_type"}
-    for row in rows:
-        for field in numeric_fields:
-            row[field] = float(row[field])
-    return rows
+def read_aggregate_records(path: Path) -> list[dict[str, Any]]:
+    records = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            record = json.loads(line)
+            if record.get("record_type") == "aggregate":
+                records.append(record)
+    if not records:
+        raise ValueError(f"No aggregate records found in {path}.")
+    return records
 
 
-def nearest_value(values: set[float], requested: float) -> float:
-    return min(values, key=lambda value: abs(value - requested))
+def filename_value(value: float) -> str:
+    return f"{value:g}".replace("-", "m").replace(".", "p")
 
 
-def plot(rows: list[dict[str, Any]], output: Path, skew_local_share: float) -> None:
+def plot_sweep_points(
+    records: list[dict[str, Any]],
+    output_dir: Path,
+    prefix: str,
+) -> list[Path]:
     try:
         import matplotlib.pyplot as plt
     except ImportError as error:
@@ -48,108 +52,60 @@ def plot(rows: list[dict[str, Any]], output: Path, skew_local_share: float) -> N
             "`uv pip install matplotlib`."
         ) from error
 
-    local_shares = sorted({row["local_share"] for row in rows})
-    rank_skews = sorted({row["rank_skew"] for row in rows})
-    zero_skew = nearest_value(set(rank_skews), 0.0)
-    selected_local_share = nearest_value(set(local_shares), skew_local_share)
+    grouped: dict[tuple[float, float], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        key = (float(record["local_share"]), float(record["rank_skew"]))
+        grouped[key].append(record)
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
-    communication_rows = sorted(
-        (row for row in rows if row["rank_skew"] == zero_skew),
-        key=lambda row: row["mean_remote_share"],
-    )
-    for field, label in (
-        ("mean_max_dispatch_ms", "dispatch"),
-        ("mean_max_compute_ms", "compute"),
-        ("mean_max_combine_ms", "combine"),
-    ):
-        axes[0, 0].plot(
-            [row["mean_remote_share"] for row in communication_rows],
-            [row[field] for row in communication_rows],
-            marker="o",
-            label=label,
-        )
-    axes[0, 0].set(
-        title=f"Communication sweep (rank_skew={zero_skew:g})",
-        xlabel="Measured remote assignment share",
-        ylabel="Latency (ms)",
-    )
-    axes[0, 0].legend()
-    axes[0, 0].grid(alpha=0.25)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = []
+    for (local_share, rank_skew), point_records in sorted(grouped.items()):
+        point_records.sort(key=lambda record: int(record["iter"]))
+        iterations = [int(record["iter"]) for record in point_records]
 
-    skew_rows = sorted(
-        (
-            row
-            for row in rows
-            if row["local_share"] == selected_local_share
-        ),
-        key=lambda row: row["rank_skew"],
-    )
-    for field, label in (
-        ("mean_max_dispatch_ms", "dispatch"),
-        ("mean_max_compute_ms", "compute"),
-        ("mean_max_combine_ms", "combine"),
-    ):
-        axes[0, 1].plot(
-            [row["rank_skew"] for row in skew_rows],
-            [row[field] for row in skew_rows],
-            marker="o",
-            label=label,
+        fig, axis = plt.subplots(figsize=(10, 5), constrained_layout=True)
+        for field, label in (
+            ("max_dispatch_ms", "dispatch"),
+            ("max_expert_compute_ms", "compute"),
+            ("max_combine_ms", "combine"),
+        ):
+            axis.plot(
+                iterations,
+                [float(record[field]) for record in point_records],
+                linewidth=1.2,
+                label=label,
+            )
+        axis.set(
+            title=(
+                f"MoE EP latency: local_share={local_share:g}, "
+                f"rank_skew={rank_skew:g}"
+            ),
+            xlabel="Iteration",
+            ylabel="Max-rank stage latency (ms)",
         )
-    axes[0, 1].set(
-        title=f"Load-skew sweep (local_share={selected_local_share:g})",
-        xlabel="Configured rank skew",
-        ylabel="Latency (ms)",
-    )
-    axes[0, 1].legend()
-    axes[0, 1].grid(alpha=0.25)
+        axis.grid(alpha=0.25)
+        axis.legend()
 
-    for local_share in local_shares:
-        selected = sorted(
-            (row for row in rows if row["local_share"] == local_share),
-            key=lambda row: row["rank_skew"],
+        filename = (
+            f"{prefix}_local_{filename_value(local_share)}"
+            f"_skew_{filename_value(rank_skew)}.png"
         )
-        axes[1, 0].plot(
-            [row["rank_skew"] for row in selected],
-            [row["mean_max_total_ms"] for row in selected],
-            marker="o",
-            label=f"local_share={local_share:g}",
-        )
-    axes[1, 0].set(
-        title="All local shares by rank skew",
-        xlabel="Configured rank skew",
-        ylabel="Stage-sum latency (ms)",
-    )
-    axes[1, 0].legend(fontsize="small")
-    axes[1, 0].grid(alpha=0.25)
+        output_path = output_dir / filename
+        fig.savefig(output_path, dpi=180)
+        plt.close(fig)
+        output_paths.append(output_path)
 
-    for rank_skew in rank_skews:
-        selected = sorted(
-            (row for row in rows if row["rank_skew"] == rank_skew),
-            key=lambda row: row["local_share"],
-        )
-        axes[1, 1].plot(
-            [row["local_share"] for row in selected],
-            [row["mean_max_total_ms"] for row in selected],
-            marker="o",
-            label=f"rank_skew={rank_skew:g}",
-        )
-    axes[1, 1].set(
-        title="All rank skews by local share",
-        xlabel="Configured local share",
-        ylabel="Stage-sum latency (ms)",
-    )
-    axes[1, 1].legend(fontsize="small")
-    axes[1, 1].grid(alpha=0.25)
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=180)
-    print(f"Wrote plot: {output}")
+    return output_paths
 
 
 def main() -> None:
     args = parse_args()
-    plot(read_rows(args.input_csv), args.output, args.skew_local_share)
+    output_paths = plot_sweep_points(
+        read_aggregate_records(args.input_jsonl),
+        args.output_dir,
+        args.prefix,
+    )
+    print(f"Wrote {len(output_paths)} plots to: {args.output_dir}")
 
 
 if __name__ == "__main__":
