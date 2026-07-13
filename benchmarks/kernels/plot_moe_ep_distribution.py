@@ -62,7 +62,6 @@ def plot(rows: list[dict[str, Any]], output: Path, skew_local_share: float) -> N
         ("mean_max_dispatch_ms", "dispatch"),
         ("mean_max_compute_ms", "compute"),
         ("mean_max_combine_ms", "combine"),
-        ("mean_max_end_to_end_ms", "end to end"),
     ):
         axes[0, 0].plot(
             [row["mean_remote_share"] for row in communication_rows],
@@ -90,7 +89,6 @@ def plot(rows: list[dict[str, Any]], output: Path, skew_local_share: float) -> N
         ("mean_max_dispatch_ms", "dispatch"),
         ("mean_max_compute_ms", "compute"),
         ("mean_max_combine_ms", "combine"),
-        ("mean_max_end_to_end_ms", "end to end"),
     ):
         axes[0, 1].plot(
             [row["rank_skew"] for row in skew_rows],
@@ -106,26 +104,43 @@ def plot(rows: list[dict[str, Any]], output: Path, skew_local_share: float) -> N
     axes[0, 1].legend()
     axes[0, 1].grid(alpha=0.25)
 
-    row_by_point = {
-        (row["rank_skew"], row["local_share"]): row for row in rows
-    }
-    for axis, field, title in (
-        (axes[1, 0], "mean_max_end_to_end_ms", "End-to-end latency (ms)"),
-        (axes[1, 1], "mean_token_imbalance", "Received-token imbalance"),
-    ):
-        matrix = [
-            [row_by_point[(skew, share)][field] for share in local_shares]
-            for skew in rank_skews
-        ]
-        image = axis.imshow(matrix, origin="lower", aspect="auto")
-        axis.set_xticks(range(len(local_shares)), [f"{x:g}" for x in local_shares])
-        axis.set_yticks(range(len(rank_skews)), [f"{x:g}" for x in rank_skews])
-        axis.set(
-            title=title,
-            xlabel="Local share",
-            ylabel="Rank skew",
+    for local_share in local_shares:
+        selected = sorted(
+            (row for row in rows if row["local_share"] == local_share),
+            key=lambda row: row["rank_skew"],
         )
-        fig.colorbar(image, ax=axis)
+        axes[1, 0].plot(
+            [row["rank_skew"] for row in selected],
+            [row["mean_max_total_ms"] for row in selected],
+            marker="o",
+            label=f"local_share={local_share:g}",
+        )
+    axes[1, 0].set(
+        title="All local shares by rank skew",
+        xlabel="Configured rank skew",
+        ylabel="Stage-sum latency (ms)",
+    )
+    axes[1, 0].legend(fontsize="small")
+    axes[1, 0].grid(alpha=0.25)
+
+    for rank_skew in rank_skews:
+        selected = sorted(
+            (row for row in rows if row["rank_skew"] == rank_skew),
+            key=lambda row: row["local_share"],
+        )
+        axes[1, 1].plot(
+            [row["local_share"] for row in selected],
+            [row["mean_max_total_ms"] for row in selected],
+            marker="o",
+            label=f"rank_skew={rank_skew:g}",
+        )
+    axes[1, 1].set(
+        title="All rank skews by local share",
+        xlabel="Configured local share",
+        ylabel="Stage-sum latency (ms)",
+    )
+    axes[1, 1].legend(fontsize="small")
+    axes[1, 1].grid(alpha=0.25)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=180)

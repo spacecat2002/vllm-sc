@@ -44,8 +44,8 @@ uv pip install matplotlib
   --tokens 4096 \
   --warmup 3 \
   --iters 10 \
-  --output-jsonl results/moe_ep_smoke.jsonl \
-  --output-csv results/moe_ep_smoke.csv
+  --output-jsonl results/data/moe_ep_smoke.jsonl \
+  --output-csv results/data/moe_ep_smoke.csv
 ```
 
 其中 JSONL 保存每个 rank、每次迭代以及聚合后的详细记录；CSV 只保存经过
@@ -68,8 +68,8 @@ trim 后的 sweep summary，主要用于绘图。
   --warmup 10 \
   --iters 100 \
   --trim-ratio 0.1 \
-  --output-jsonl results/moe_ep_distribution.jsonl \
-  --output-csv results/moe_ep_distribution.csv
+  --output-jsonl results/data/moe_ep_distribution.jsonl \
+  --output-csv results/data/moe_ep_distribution.csv
 ```
 
 如需测试 Qwen3-235B-A22B，将 preset 替换为：
@@ -96,8 +96,8 @@ trim 后的 sweep summary，主要用于绘图。
   --rank-skew 0 \
   --warmup 10 \
   --iters 100 \
-  --output-jsonl results/moe_ep_communication.jsonl \
-  --output-csv results/moe_ep_communication.csv
+  --output-jsonl results/data/moe_ep_communication.jsonl \
+  --output-csv results/data/moe_ep_communication.csv
 ```
 
 只观察负载倾斜时，固定 `local_share`，使总远端通信比例保持不变：
@@ -113,8 +113,8 @@ trim 后的 sweep summary，主要用于绘图。
   --hot-rank 0 \
   --warmup 10 \
   --iters 100 \
-  --output-jsonl results/moe_ep_rank_skew.jsonl \
-  --output-csv results/moe_ep_rank_skew.csv
+  --output-jsonl results/data/moe_ep_rank_skew.jsonl \
+  --output-csv results/data/moe_ep_rank_skew.csv
 ```
 
 ## 多节点实验
@@ -137,8 +137,8 @@ trim 后的 sweep summary，主要用于绘图。
   --hot-rank 0 \
   --warmup 10 \
   --iters 100 \
-  --output-jsonl results/moe_ep_distribution.jsonl \
-  --output-csv results/moe_ep_distribution.csv
+  --output-jsonl results/data/moe_ep_distribution.jsonl \
+  --output-csv results/data/moe_ep_distribution.csv
 ```
 
 只有 global rank 0 写结果文件。多节点运行时应确保 rank 0 的输出目录存在且可写；
@@ -151,24 +151,27 @@ trim 后的 sweep summary，主要用于绘图。
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib-cache \
 .venv/bin/python benchmarks/kernels/plot_moe_ep_distribution.py \
-  --input-csv results/moe_ep_distribution.csv \
-  --output results/moe_ep_distribution.png \
+  --input-csv results/data/moe_ep_distribution.csv \
+  --output results/plots/moe_ep_distribution.png \
   --skew-local-share 0.5
 ```
 
-图片包含通信比例曲线、固定 `local_share` 的负载倾斜曲线、端到端延迟热力图和
-接收 token 不均衡热力图。
+JSONL 和 CSV 数据保存在 `results/data/`，生成的 PNG 单独保存在
+`results/plots/`。图片包含四张折线图：通信比例的 stage 耗时、固定
+`local_share` 的负载倾斜 stage 耗时、所有 `local_share` 对应的
+`rank_skew` stage-sum 曲线，以及所有 `rank_skew` 对应的 `local_share`
+stage-sum 曲线。图中不绘制 end-to-end latency。
 
 ## 结果解读
 
 通信实验中应先确认 `mean_token_imbalance` 接近 `1`，再观察
 `mean_max_dispatch_ms`、`mean_max_combine_ms` 和
-`mean_max_end_to_end_ms` 随 `mean_remote_share` 的变化。
+`mean_max_total_ms` 随 `mean_remote_share` 的变化。
 
 负载倾斜实验中应先确认不同 `rank_skew` 下的 `mean_remote_share` 基本不变，
-然后观察 `mean_token_imbalance`、`mean_max_compute_ms` 和端到端延迟之间的关系。
+然后观察 `mean_token_imbalance`、`mean_max_compute_ms` 和 stage-sum latency
+之间的关系。
 
-`mean_max_end_to_end_ms` 包含 stage barrier 的等待时间，用于反映当前同步实验模型
-下的完整关键路径；`mean_max_dispatch_ms`、`mean_max_compute_ms` 和
-`mean_max_combine_ms` 则表示 barrier 之后各阶段自身的最大耗时。不要将三个阶段
-最大值的简单相加当成真实端到端延迟。
+图中的 `mean_max_total_ms` 是同一 rank 上 dispatch、compute 和 combine 耗时的
+和，用于比较不同路由分布下的 stage 总成本；它不等于真实端到端延迟。CSV 和
+JSONL 中仍保留 `mean_max_end_to_end_ms`，但绘图脚本不再展示该指标。
